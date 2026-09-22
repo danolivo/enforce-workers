@@ -57,3 +57,13 @@ dkms.conf
 # LLVM bitcode from a JIT-enabled build
 *.bc
 *.index.bc
+
+# Regression test artefacts
+/results/
+/tmp_check/
+/log/
+/regression.diffs
+/regression.out
+
+# ... but the expected output is source, and *.out above would hide it
+!expected/*.out

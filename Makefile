@@ -8,6 +8,8 @@ OBJS = \
 
 PGFILEDESC = "enforce_workers - planner overrides for parallelism and nested loops"
 
+REGRESS = nlguard
+
 ifdef USE_PGXS
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

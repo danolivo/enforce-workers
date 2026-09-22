@@ -16,3 +16,14 @@ enforce_workers = shared_module('enforce_workers',
   kwargs: contrib_mod_args,
 )
 contrib_targets += enforce_workers
+
+tests += {
+  'name': 'enforce_workers',
+  'sd': meson.current_source_dir(),
+  'bd': meson.current_build_dir(),
+  'regress': {
+    'sql': [
+      'nlguard',
+    ],
+  },
+}

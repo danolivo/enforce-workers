@@ -118,6 +118,17 @@ a plain nested loop at all.
   implicitly: every nested loop already carries a penalty and it finds nothing
   to act on.
 
+### Tests
+
+    make check                  # temp instance
+    make installcheck           # against a running server
+
+`sql/nlguard.sql` covers: a plain nested loop being replaced; an index nested
+loop surviving; both together in a four-way join; LIMIT and cursor; a
+semijoin; a join with no hashable or mergeable clause, where planning must
+still succeed; `enable_nestloop = off`; `log` mode changing nothing; and the
+rewritten plan returning the same rows.
+
 ## Build
 
 In-tree:
