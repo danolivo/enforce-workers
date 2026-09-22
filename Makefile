@@ -1,6 +1,10 @@
 # contrib/enforce-workers/Makefile
 
-MODULES = enforce_workers
+MODULE_big = enforce_workers
+OBJS = \
+	$(WIN32RES) \
+	enforce_workers.o
+
 PGFILEDESC = "enforce_workers - make parallel workers available on any relation"
 
 ifdef USE_PGXS
