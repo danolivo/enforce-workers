@@ -22,13 +22,19 @@ VACUUM ANALYZE nlg_idx;
 VACUUM ANALYZE nlg_idx2;
 VACUUM ANALYZE nlg_tiny;
 
--- The module must do nothing at all until it is asked to.
+-- The module is active from the moment the library is loaded.
 SHOW nlguard.mode;
+
+-- Every block below states the mode it runs in rather than leaning on the
+-- default, so that this file keeps testing the same things if the default
+-- ever moves again.
 
 --
 -- A plain nested loop: one outer row, inner side read whole.  This is the
 -- shape the module refuses.
 --
+SET nlguard.mode = off;
+
 EXPLAIN (COSTS OFF)
 SELECT * FROM nlg_drv d JOIN nlg_tiny t ON t.k = d.k WHERE d.id = 5000;
 
@@ -36,13 +42,13 @@ SET nlguard.mode = on;
 
 EXPLAIN (COSTS OFF)
 SELECT * FROM nlg_drv d JOIN nlg_tiny t ON t.k = d.k WHERE d.id = 5000;
-
-RESET nlguard.mode;
 
 --
 -- An index nested loop: the inner path is parameterised by the outer
 -- relation, so it is not read whole.  It must survive untouched.
 --
+SET nlguard.mode = off;
+
 EXPLAIN (COSTS OFF)
 SELECT * FROM nlg_drv d JOIN nlg_idx i ON i.id = d.id;
 
@@ -50,8 +56,6 @@ SET nlguard.mode = on;
 
 EXPLAIN (COSTS OFF)
 SELECT * FROM nlg_drv d JOIN nlg_idx i ON i.id = d.id;
-
-RESET nlguard.mode;
 
 --
 -- Both shapes in one query.  add_paths_to_joinrel() runs once per pair of
@@ -60,6 +64,8 @@ RESET nlguard.mode;
 -- against the path itself would mistake these index nested loops for plain
 -- ones.  Both must survive; only the nlg_tiny join may change.
 --
+SET nlguard.mode = off;
+
 EXPLAIN (COSTS OFF)
 SELECT * FROM nlg_drv d
   JOIN nlg_idx  i ON i.id = d.id
@@ -73,8 +79,6 @@ SELECT * FROM nlg_drv d
   JOIN nlg_idx  i ON i.id = d.id
   JOIN nlg_idx2 j ON j.id = d.id2
   JOIN nlg_tiny t ON t.k = d.k;
-
-RESET nlguard.mode;
 
 --
 -- A LIMIT means somebody wants rows early, so the module stays out.
@@ -97,8 +101,6 @@ EXPLAIN (COSTS OFF)
 SELECT * FROM nlg_drv d
 WHERE EXISTS (SELECT 1 FROM nlg_tiny t WHERE t.k = d.k) AND d.id = 5000;
 
-RESET nlguard.mode;
-
 --
 -- No hashable and no mergeable clause: the second pass finds no alternative,
 -- the penalised nested loop stays, and planning still succeeds.  The node is
@@ -111,14 +113,13 @@ SELECT * FROM nlg_drv d JOIN nlg_tiny t ON t.k > d.k WHERE d.id = 5000;
 
 SELECT count(*) FROM nlg_drv d JOIN nlg_tiny t ON t.k > d.k WHERE d.id = 5000;
 
-RESET nlguard.mode;
-
 --
 -- With enable_nestloop already off, every nested loop carries a penalty
 -- before we look at it, so the module finds nothing to do and the plan is the
 -- one the core would have produced on its own.
 --
 SET enable_nestloop = off;
+SET nlguard.mode = off;
 
 EXPLAIN (COSTS OFF)
 SELECT * FROM nlg_drv d JOIN nlg_tiny t ON t.k > d.k WHERE d.id = 5000;
@@ -128,7 +129,6 @@ SET nlguard.mode = on;
 EXPLAIN (COSTS OFF)
 SELECT * FROM nlg_drv d JOIN nlg_tiny t ON t.k > d.k WHERE d.id = 5000;
 
-RESET nlguard.mode;
 RESET enable_nestloop;
 
 --
@@ -145,17 +145,16 @@ SELECT * FROM nlg_drv d JOIN nlg_tiny t ON t.k = d.k WHERE d.id = 5000;
 
 \set VERBOSITY default
 RESET nlguard.log_level;
-RESET nlguard.mode;
 
 --
 -- The rewritten plan must return the same rows as the original one.
 --
+SET nlguard.mode = off;
+
 SELECT count(*), sum(d.id) FROM nlg_drv d JOIN nlg_tiny t ON t.k = d.k;
 
 SET nlguard.mode = on;
 
 SELECT count(*), sum(d.id) FROM nlg_drv d JOIN nlg_tiny t ON t.k = d.k;
-
-RESET nlguard.mode;
 
 DROP TABLE nlg_drv, nlg_idx, nlg_idx2, nlg_tiny;

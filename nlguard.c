@@ -71,7 +71,10 @@
  *
  * Load it with
  *		LOAD 'enforce_workers';
- * and turn it on with nlguard.mode; it does nothing by default.
+ * and the module is active: nlguard.mode defaults to "on", in keeping with
+ * enforce_workers in the same library, which also takes effect the moment it
+ * is loaded.  Set nlguard.mode = off to get the core planner back, or = log
+ * to see which joins would be affected without changing any plan.
  *
  *-------------------------------------------------------------------------
  */
@@ -114,7 +117,7 @@ static const struct config_enum_entry nlguard_loglevel_options[] = {
 	{NULL, 0, false}
 };
 
-static int	nlguard_mode = NLGUARD_OFF;
+static int	nlguard_mode = NLGUARD_ON;
 static int	nlguard_log_level = DEBUG1;
 
 static set_join_pathlist_hook_type prev_set_join_pathlist_hook = NULL;
@@ -452,7 +455,7 @@ nlguard_init(void)
 							 "Controls how plain nested loops are treated.",
 							 "off leaves planning alone; log reports the joins that would be affected; on penalises them and lets the planner rebuild the alternatives.",
 							 &nlguard_mode,
-							 NLGUARD_OFF,
+							 NLGUARD_ON,
 							 nlguard_mode_options,
 							 PGC_USERSET,
 							 0,

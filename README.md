@@ -1,8 +1,13 @@
 # enforce_workers
 
 Two unrelated planner overrides in one loadable module: `enforce_workers`
-below, and `nlguard` further down. Each lives in its own file and is switched
-on independently; `_PG_init()` is the only entry point.
+below, and `nlguard` further down. Each lives in its own file and can be
+switched off independently; `_PG_init()` is the only entry point.
+
+**Both are active the moment the library is loaded.** `enforce_workers` has no
+switch at all, and `nlguard.mode` defaults to `on`. Loading this library
+changes plans — that is what it is for — so do not put it in
+`shared_preload_libraries` of a server you have not measured it on.
 
 ## enforce_workers
 
@@ -67,13 +72,14 @@ penalised loop stays, and planning still succeeds.
 
 | name | type | default | meaning |
 |---|---|---|---|
-| `nlguard.mode` | enum | `off` | `off` / `log` / `on` |
+| `nlguard.mode` | enum | `on` | `off` / `log` / `on` |
 | `nlguard.log_level` | enum | `debug1` | level for the report, as in `auto_explain` |
 
-`log` mode evaluates the rule and reports every join it matches, without
-changing a single plan. Raising `log_level` to `log` makes the logger process
-part of the measurement, so on a busy system prefer `debug1` with
-`log_min_messages` set for the duration of the run.
+`off` gives the core planner back, unchanged. `log` evaluates the rule and
+reports every join it matches, without changing a single plan. Raising
+`log_level` to `log` makes the logger process part of the measurement, so on a
+busy system prefer `debug1` with `log_min_messages` set for the duration of
+the run.
 
 The visible record of the module acting is `EXPLAIN`, which reports a
 penalised node as `Disabled: true` when it survives anyway.
@@ -108,12 +114,20 @@ a plain nested loop at all.
   not been evaluated yet. There is no hook between the last
   `add_paths_to_joinrel()` for a joinrel and `set_cheapest()`, so this cannot
   be fixed from an extension.
-* `disabled_nodes` outranks cost outright, so there is no upper bound on how
-  much worse the replacement plan can be. A guard on the absolute size of the
-  inner side would be the obvious next thing to add — not one on the cost
-  ratio, which would be computed from the very estimates in question.
-* `nlguard.mode = off` by default, so loading the library for
-  `enforce_workers` alone changes no join method.
+* `disabled_nodes` outranks cost outright, and there is no dial. That is
+  deliberate, and it needs no guard: the damage either way is asymmetric by
+  construction. Replacing a nested loop that really did have a tiny outer side
+  costs one hash build over the inner side — a small constant factor, or a log
+  factor if lost pathkeys force a sort. Keeping a nested loop whose outer
+  cardinality was underestimated N-fold costs N. A plan-time guard would have
+  to be computed from the estimates the module exists to distrust, and in the
+  workload that motivated it — a large unanalysed temp table on the inner side
+  — it would fire against its own purpose. If a limit is ever wanted it has to
+  come from measurement rather than estimation: observed per-query-form error,
+  or runtime correction.
+* `nlguard.mode` defaults to `on`, so loading this library for
+  `enforce_workers` alone still changes join methods. Set `nlguard.mode = off`
+  if that is not what you want.
 * Setting `enable_nestloop = off` for the session disables the module
   implicitly: every nested loop already carries a penalty and it finds nothing
   to act on.
@@ -150,7 +164,16 @@ There are no SQL objects, so no `CREATE EXTENSION`:
 or put `enforce_workers` in `session_preload_libraries` or
 `shared_preload_libraries`.
 
-## Caveats
+Both overrides take effect immediately. To load the library for one of them
+only:
+
+    LOAD 'enforce_workers';
+    SET nlguard.mode = off;          -- parallelism override only
+
+`enforce_workers` has no equivalent switch; unload the library to be rid of
+it.
+
+## Caveats (enforce_workers)
 
 * Making a partial path *available* is not the same as making it *win*.
   `parallel_setup_cost` (1000 by default) will sink the parallel plan on a small
