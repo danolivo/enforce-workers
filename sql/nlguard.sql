@@ -1,0 +1,161 @@
+LOAD 'enforce_workers';
+
+-- enforce_workers offers partial paths for every relation, and this file is
+-- about join methods only, so keep parallelism out of the plans.
+SET max_parallel_workers_per_gather = 0;
+
+CREATE TABLE nlg_drv (id int, id2 int, k int);
+CREATE TABLE nlg_idx (id int primary key);
+CREATE TABLE nlg_idx2 (id int primary key);
+CREATE TABLE nlg_tiny (k int);
+
+-- nlg_drv keys are spread across the whole range of nlg_idx, so that a merge
+-- join cannot stop early and the index nested loop is the plan to beat.
+INSERT INTO nlg_drv SELECT i * 5000, i * 5000 + 1, i % 5
+  FROM generate_series(1, 20) i;
+INSERT INTO nlg_idx SELECT i FROM generate_series(1, 100000) i;
+INSERT INTO nlg_idx2 SELECT i FROM generate_series(1, 100000) i;
+INSERT INTO nlg_tiny SELECT i FROM generate_series(0, 4) i;
+
+VACUUM ANALYZE nlg_drv;
+VACUUM ANALYZE nlg_idx;
+VACUUM ANALYZE nlg_idx2;
+VACUUM ANALYZE nlg_tiny;
+
+-- The module must do nothing at all until it is asked to.
+SHOW nlguard.mode;
+
+--
+-- A plain nested loop: one outer row, inner side read whole.  This is the
+-- shape the module refuses.
+--
+EXPLAIN (COSTS OFF)
+SELECT * FROM nlg_drv d JOIN nlg_tiny t ON t.k = d.k WHERE d.id = 5000;
+
+SET nlguard.mode = on;
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM nlg_drv d JOIN nlg_tiny t ON t.k = d.k WHERE d.id = 5000;
+
+RESET nlguard.mode;
+
+--
+-- An index nested loop: the inner path is parameterised by the outer
+-- relation, so it is not read whole.  It must survive untouched.
+--
+EXPLAIN (COSTS OFF)
+SELECT * FROM nlg_drv d JOIN nlg_idx i ON i.id = d.id;
+
+SET nlguard.mode = on;
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM nlg_drv d JOIN nlg_idx i ON i.id = d.id;
+
+RESET nlguard.mode;
+
+--
+-- Both shapes in one query.  add_paths_to_joinrel() runs once per pair of
+-- input relations and joinrel->pathlist accumulates across those calls, so a
+-- policy that judged a path against the hook's current arguments rather than
+-- against the path itself would mistake these index nested loops for plain
+-- ones.  Both must survive; only the nlg_tiny join may change.
+--
+EXPLAIN (COSTS OFF)
+SELECT * FROM nlg_drv d
+  JOIN nlg_idx  i ON i.id = d.id
+  JOIN nlg_idx2 j ON j.id = d.id2
+  JOIN nlg_tiny t ON t.k = d.k;
+
+SET nlguard.mode = on;
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM nlg_drv d
+  JOIN nlg_idx  i ON i.id = d.id
+  JOIN nlg_idx2 j ON j.id = d.id2
+  JOIN nlg_tiny t ON t.k = d.k;
+
+RESET nlguard.mode;
+
+--
+-- A LIMIT means somebody wants rows early, so the module stays out.
+--
+SET nlguard.mode = on;
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM nlg_drv d JOIN nlg_tiny t ON t.k = d.k WHERE d.id = 5000 LIMIT 1;
+
+-- Same question at cursor level, through cursor_tuple_fraction.
+EXPLAIN (COSTS OFF)
+DECLARE nlg_cur CURSOR FOR
+SELECT * FROM nlg_drv d JOIN nlg_tiny t ON t.k = d.k WHERE d.id = 5000;
+
+--
+-- A semijoin stops after the first match, so the inner side is not read
+-- whole and the nested loop is left alone.
+--
+EXPLAIN (COSTS OFF)
+SELECT * FROM nlg_drv d
+WHERE EXISTS (SELECT 1 FROM nlg_tiny t WHERE t.k = d.k) AND d.id = 5000;
+
+RESET nlguard.mode;
+
+--
+-- No hashable and no mergeable clause: the second pass finds no alternative,
+-- the penalised nested loop stays, and planning still succeeds.  The node is
+-- reported as disabled, which is how a plan shows that this module acted.
+--
+SET nlguard.mode = on;
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM nlg_drv d JOIN nlg_tiny t ON t.k > d.k WHERE d.id = 5000;
+
+SELECT count(*) FROM nlg_drv d JOIN nlg_tiny t ON t.k > d.k WHERE d.id = 5000;
+
+RESET nlguard.mode;
+
+--
+-- With enable_nestloop already off, every nested loop carries a penalty
+-- before we look at it, so the module finds nothing to do and the plan is the
+-- one the core would have produced on its own.
+--
+SET enable_nestloop = off;
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM nlg_drv d JOIN nlg_tiny t ON t.k > d.k WHERE d.id = 5000;
+
+SET nlguard.mode = on;
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM nlg_drv d JOIN nlg_tiny t ON t.k > d.k WHERE d.id = 5000;
+
+RESET nlguard.mode;
+RESET enable_nestloop;
+
+--
+-- log mode reports and changes nothing.  The estimates the module reports
+-- live in the detail field, which terse verbosity hides, so that this test
+-- does not depend on them.
+--
+SET nlguard.mode = log;
+SET nlguard.log_level = notice;
+\set VERBOSITY terse
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM nlg_drv d JOIN nlg_tiny t ON t.k = d.k WHERE d.id = 5000;
+
+\set VERBOSITY default
+RESET nlguard.log_level;
+RESET nlguard.mode;
+
+--
+-- The rewritten plan must return the same rows as the original one.
+--
+SELECT count(*), sum(d.id) FROM nlg_drv d JOIN nlg_tiny t ON t.k = d.k;
+
+SET nlguard.mode = on;
+
+SELECT count(*), sum(d.id) FROM nlg_drv d JOIN nlg_tiny t ON t.k = d.k;
+
+RESET nlguard.mode;
+
+DROP TABLE nlg_drv, nlg_idx, nlg_idx2, nlg_tiny;
