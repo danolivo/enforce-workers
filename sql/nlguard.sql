@@ -118,13 +118,28 @@ SELECT * FROM nlg_drv d
 WHERE d.id = 5000;
 
 --
--- No join clause at all.  Nothing but a nested loop can execute this, so the
--- second pass has nothing to offer and the penalised loop is the plan.
+-- No join clause at all.  Nothing but a nested loop can execute this, and
+-- unlike the case below the module can tell in advance: hash and merge paths
+-- are both built from the restrict list, so an empty one rules them out.  The
+-- join is skipped outright, which is why this loop is not reported as
+-- disabled - there was never an alternative to prefer over it.
 --
 EXPLAIN (COSTS OFF)
 SELECT * FROM nlg_drv d, nlg_tiny t WHERE d.id = 5000;
 
 SELECT count(*) FROM nlg_drv d, nlg_tiny t WHERE d.id = 5000;
+
+-- Nothing is reported for it either, not even in log mode.
+SET nlguard.mode = log;
+SET nlguard.log_level = notice;
+\set VERBOSITY terse
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM nlg_drv d, nlg_tiny t WHERE d.id = 5000;
+
+\set VERBOSITY default
+RESET nlguard.log_level;
+SET nlguard.mode = on;
 
 --
 -- No hashable and no mergeable clause: the second pass finds no alternative,

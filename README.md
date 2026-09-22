@@ -98,16 +98,27 @@ Measure your own workload before turning it on; the cost scales with how often
 the module fires, and without a row threshold it fires on most joins that have
 a plain nested loop at all.
 
-The worst case is a join with no clause at all. A two-relation cross join
-produces four candidates rather than one — `match_unsorted_outer()` offers
-both a plain and a materialised inner path, and both join orders are tried —
-and with no hash or merge path possible nothing dominates any of them. All
-four reach the hook, all four are penalised, and each one costs a second pass
-that can only come back empty-handed. Skipping the pass when no clause could
-be hashed or merged would mean carrying a copy of the test inside
-`hash_inner_and_outer()`, which is the duplication this design exists to
-avoid; four useless passes on a cross join is the cheaper mistake, but a
-workload full of them is not.
+One join is ruled out in advance rather than attempted: a join with no clause
+at all. `hash_inner_and_outer()` and `select_mergejoin_clauses()` both build
+from the restrict list, so an empty list means neither can produce a path, and
+a nested loop is the only way to compute the join. Such a join is skipped
+outright — not penalised, not reported, no second pass.
+
+It is worth having. Without the test a two-relation cross join is the worst
+case in the module: it produces four candidates rather than one —
+`match_unsorted_outer()` offers a plain and a materialised inner path, and
+both join orders are tried — nothing dominates any of them, and each costs a
+pass that comes back empty-handed. Measured, the notices for one cross join go
+from four to none.
+
+The test stops there. "No clause that could be hashed or merged" looks like
+the natural generalisation and is wrong: an FDW's `GetForeignJoinPaths()` can
+offer a path for a join qual of any shape, and that path can have been
+dominated by the nested loop in the first pass exactly as a hash path would
+be. So the skip also requires `joinrel->fdwroutine == NULL`. Together the two
+conditions are the only case where "no alternative exists" can be stated
+rather than guessed; a non-equality clause such as `a.x > b.x` still costs a
+pass to find out.
 
 ### Caveats
 

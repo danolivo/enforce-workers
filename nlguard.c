@@ -69,19 +69,23 @@
  * how often the module fires - which, with no row threshold, is most joins
  * that have a plain nested loop at all.  Measure it before turning this on.
  *
- * The worst case for that second price is a join with no clause at all.  A
- * two-relation cross join produces four candidates, not one: match_unsorted_
- * outer() offers both a plain and a materialised inner path, and
- * populate_joinrel_with_paths() runs both join orders.  With no hash or merge
- * path possible, nothing dominates any of them, so all four survive to the
- * hook, all four are penalised, and each one costs a regeneration pass that
- * can only come back empty-handed.
+ * There is one join we can rule out in advance, and we do: a join with no
+ * clause at all.  Both hash_inner_and_outer() and select_mergejoin_clauses()
+ * draw their clauses from extra->restrictlist, so an empty list means neither
+ * can produce a path, and the second pass is provably wasted.  Without that
+ * test a two-relation cross join is the worst case in the whole module: it
+ * produces four candidates rather than one - match_unsorted_outer() offers a
+ * plain and a materialised inner path, and populate_joinrel_with_paths() runs
+ * both join orders - nothing dominates any of them, and each costs a pass
+ * that comes back empty-handed.
  *
- * It would be possible to skip the second pass when extra->restrictlist has
- * no clause we could hash or merge on - but that test is a copy of the one
- * inside hash_inner_and_outer() and select_mergejoin_clauses(), which is the
- * duplication this design exists to avoid.  Paying four useless passes on a
- * cross join is the cheaper mistake; a workload full of them is not.
+ * The test has to stop there, though.  "No clause we could hash or merge on"
+ * looks like the natural generalisation, and it is wrong: an FDW's
+ * GetForeignJoinPaths() can offer a path for a join qual of any shape, and
+ * that path may have been dominated by the nested loop in the first pass just
+ * like a hash path would be.  Hence the fdwroutine test alongside the empty
+ * list - together they are the only case where "no alternative exists" can be
+ * stated rather than guessed.
  *
  * Load it with
  *		LOAD 'enforce_workers';
@@ -348,6 +352,24 @@ nlguard_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 	 * set at all on joinrels".
 	 */
 	if (root->tuple_fraction != 0.0)
+		return;
+
+	/*
+	 * A join with no clause is the one case where the second pass can be
+	 * ruled out in advance rather than attempted and found useless.
+	 * hash_inner_and_outer() and select_mergejoin_clauses() both build from
+	 * extra->restrictlist, so an empty list means neither can produce a path,
+	 * and an unparameterised nested loop is the only way to compute this join
+	 * at all.  Leaving it unpenalised also keeps a disabled node out of every
+	 * path built on top of it, and out of EXPLAIN, where it would have said
+	 * only that this module had been past.
+	 *
+	 * The fdwroutine test is not decoration.  GetForeignJoinPaths() runs from
+	 * add_paths_to_joinrel() whatever the clauses look like - including none -
+	 * and its path competes in add_path() like any other, so for a foreign
+	 * join the second pass still has something to rebuild.
+	 */
+	if (extra->restrictlist == NIL && joinrel->fdwroutine == NULL)
 		return;
 
 	/*
