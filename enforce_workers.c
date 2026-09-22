@@ -1,7 +1,8 @@
 /*-------------------------------------------------------------------------
  *
  * enforce_workers.c
- *		Make parallel workers available on every relation, regardless of size.
+ *		Make parallel workers available on every relation, regardless of size,
+ *		and host the module's single entry point.
  *
  * The planner decides how many parallel workers a scan may use in
  * compute_parallel_worker().  When RelOptInfo->rel_parallel_workers is left at
@@ -18,9 +19,10 @@
  *		LOAD 'enforce_workers';
  * or by listing it in session_preload_libraries / shared_preload_libraries.
  *
- * Each feature of this module keeps to its own file and exposes one
- * initialiser; _PG_init() at the bottom of this file is the only entry point
- * and the only place that decides what gets installed.
+ * The module has grown a second, unrelated planner tweak in nlguard.c.  Each
+ * feature keeps to its own file and exposes one initialiser; _PG_init() at
+ * the bottom of this file is the only entry point and the only place that
+ * decides what gets installed.
  *
  *-------------------------------------------------------------------------
  */
@@ -30,6 +32,8 @@
 #include "nodes/pathnodes.h"
 #include "optimizer/cost.h"
 #include "optimizer/plancat.h"
+
+#include "enforce_workers.h"
 
 PG_MODULE_MAGIC;
 
@@ -83,4 +87,5 @@ void
 _PG_init(void)
 {
 	enforce_workers_init();
+	nlguard_init();
 }

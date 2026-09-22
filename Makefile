@@ -3,9 +3,10 @@
 MODULE_big = enforce_workers
 OBJS = \
 	$(WIN32RES) \
-	enforce_workers.o
+	enforce_workers.o \
+	nlguard.o
 
-PGFILEDESC = "enforce_workers - make parallel workers available on any relation"
+PGFILEDESC = "enforce_workers - planner overrides for parallelism and nested loops"
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config
