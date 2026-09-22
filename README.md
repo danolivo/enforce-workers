@@ -137,11 +137,21 @@ a plain nested loop at all.
     make check                  # temp instance
     make installcheck           # against a running server
 
-`sql/nlguard.sql` covers: a plain nested loop being replaced; an index nested
-loop surviving; both together in a four-way join; LIMIT and cursor; a
-semijoin; a join with no hashable or mergeable clause, where planning must
-still succeed; `enable_nestloop = off`; `log` mode changing nothing; and the
-rewritten plan returning the same rows.
+`sql/nlguard.sql` covers:
+
+* a plain nested loop being replaced by a hash join;
+* an index nested loop surviving untouched;
+* both together in a four-way join — the case where judging a path by the
+  hook's arguments instead of by the path would misfire;
+* every reason the policy has for standing aside: LIMIT, a cursor, a
+  semijoin, an antijoin, and `inner_unique` proved through a DISTINCT
+  subquery;
+* every reason no alternative exists: a join with no hashable and no
+  mergeable clause, and a join with no clause at all — planning must still
+  succeed and the surviving loop is reported as `Disabled: true`;
+* `enable_nestloop = off`, where the module must find nothing to do;
+* `log` mode changing no plan;
+* the rewritten plans returning the same rows as the originals.
 
 ## Build
 

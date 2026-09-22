@@ -101,6 +101,31 @@ EXPLAIN (COSTS OFF)
 SELECT * FROM nlg_drv d
 WHERE EXISTS (SELECT 1 FROM nlg_tiny t WHERE t.k = d.k) AND d.id = 5000;
 
+-- An antijoin stops at the first match too.
+EXPLAIN (COSTS OFF)
+SELECT * FROM nlg_drv d
+WHERE NOT EXISTS (SELECT 1 FROM nlg_tiny t WHERE t.k = d.k) AND d.id = 5000;
+
+--
+-- inner_unique is the third way to stop early, and the only one that is not
+-- visible in the join type.  A DISTINCT subquery on the inner side gives the
+-- planner what it needs to prove it, without an index that would make this a
+-- parameterised nested loop instead.
+--
+EXPLAIN (COSTS OFF)
+SELECT * FROM nlg_drv d
+  JOIN (SELECT DISTINCT k FROM nlg_tiny) u ON u.k = d.k
+WHERE d.id = 5000;
+
+--
+-- No join clause at all.  Nothing but a nested loop can execute this, so the
+-- second pass has nothing to offer and the penalised loop is the plan.
+--
+EXPLAIN (COSTS OFF)
+SELECT * FROM nlg_drv d, nlg_tiny t WHERE d.id = 5000;
+
+SELECT count(*) FROM nlg_drv d, nlg_tiny t WHERE d.id = 5000;
+
 --
 -- No hashable and no mergeable clause: the second pass finds no alternative,
 -- the penalised nested loop stays, and planning still succeeds.  The node is
