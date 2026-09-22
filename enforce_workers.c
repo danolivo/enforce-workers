@@ -18,6 +18,10 @@
  *		LOAD 'enforce_workers';
  * or by listing it in session_preload_libraries / shared_preload_libraries.
  *
+ * Each feature of this module keeps to its own file and exposes one
+ * initialiser; _PG_init() at the bottom of this file is the only entry point
+ * and the only place that decides what gets installed.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -61,9 +65,22 @@ enforce_workers_get_relation_info(PlannerInfo *root, Oid relationObjectId,
 	rel->rel_parallel_workers = max_parallel_workers_per_gather;
 }
 
-void
-_PG_init(void)
+/*
+ * enforce_workers_init
+ *		Install the relation-size override.
+ *
+ * Kept separate from _PG_init() so that every feature in the module is
+ * initialised the same way, whichever file it lives in.
+ */
+static void
+enforce_workers_init(void)
 {
 	prev_get_relation_info_hook = get_relation_info_hook;
 	get_relation_info_hook = enforce_workers_get_relation_info;
+}
+
+void
+_PG_init(void)
+{
+	enforce_workers_init();
 }
