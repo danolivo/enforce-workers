@@ -98,6 +98,17 @@ Measure your own workload before turning it on; the cost scales with how often
 the module fires, and without a row threshold it fires on most joins that have
 a plain nested loop at all.
 
+The worst case is a join with no clause at all. A two-relation cross join
+produces four candidates rather than one — `match_unsorted_outer()` offers
+both a plain and a materialised inner path, and both join orders are tried —
+and with no hash or merge path possible nothing dominates any of them. All
+four reach the hook, all four are penalised, and each one costs a second pass
+that can only come back empty-handed. Skipping the pass when no clause could
+be hashed or merged would mean carrying a copy of the test inside
+`hash_inner_and_outer()`, which is the duplication this design exists to
+avoid; four useless passes on a cross join is the cheaper mistake, but a
+workload full of them is not.
+
 ### Caveats
 
 * `add_paths_to_joinrel()` runs twice for the joins that match, so everything

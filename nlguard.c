@@ -69,6 +69,20 @@
  * how often the module fires - which, with no row threshold, is most joins
  * that have a plain nested loop at all.  Measure it before turning this on.
  *
+ * The worst case for that second price is a join with no clause at all.  A
+ * two-relation cross join produces four candidates, not one: match_unsorted_
+ * outer() offers both a plain and a materialised inner path, and
+ * populate_joinrel_with_paths() runs both join orders.  With no hash or merge
+ * path possible, nothing dominates any of them, so all four survive to the
+ * hook, all four are penalised, and each one costs a regeneration pass that
+ * can only come back empty-handed.
+ *
+ * It would be possible to skip the second pass when extra->restrictlist has
+ * no clause we could hash or merge on - but that test is a copy of the one
+ * inside hash_inner_and_outer() and select_mergejoin_clauses(), which is the
+ * duplication this design exists to avoid.  Paying four useless passes on a
+ * cross join is the cheaper mistake; a workload full of them is not.
+ *
  * Load it with
  *		LOAD 'enforce_workers';
  * and the module is active: nlguard.mode defaults to "on", in keeping with
