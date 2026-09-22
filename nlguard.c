@@ -1,8 +1,8 @@
 /*-------------------------------------------------------------------------
  *
  * nlguard.c
- *		Find the plain nested loops in a plan - the ones that read the whole
- *		inner side once per outer row - and report them.
+ *		Refuse the plain nested loop - the one that reads its whole inner side
+ *		once per outer row - wherever the core can offer anything else.
  *
  * The cost of a nested loop grows linearly with the number of outer rows:
  *
@@ -37,11 +37,41 @@
  * the inner path draws parameters from the outer relation, is exactly the
  * case Leis et al. exclude, and so does this module.  The same goes for the
  * joins that stop after the first match, and for any query that wants rows
- * early.
+ * early.  There is deliberately no row-count threshold: a threshold would be
+ * a calibration against one workload dressed up as a rule, and the decision
+ * would rest on the very estimate whose reliability is in question.
  *
- * At this stage the module only reports.  Load it with
+ * Mechanism
+ * ---------
+ * The obvious implementation - walk joinrel->pathlist in
+ * set_join_pathlist_hook and bump disabled_nodes on the offending nested loop
+ * - does not work on its own.  The hook runs at the very end of
+ * add_paths_to_joinrel(), by which point add_path() has already discarded the
+ * hash and merge paths that lost to the nested loop on cost.  Penalising the
+ * nested loop after the fact leaves the joinrel with nothing to fall back to.
+ *
+ * Rather than rebuild those alternatives here - which would mean carrying a
+ * copy of hash_inner_and_outer() and keeping it in step with every major
+ * release - we penalise the nested loop and then ask the core to generate the
+ * join paths again with enable_nestloop turned off.  The second pass rebuilds
+ * the hash and merge paths with the same code that built them the first time;
+ * they are no longer dominated, because the nested loop now carries a
+ * disabled node, so add_path() keeps them.  If no alternative is possible -
+ * no hashable or mergeable clause - the second pass adds nothing and the
+ * penalised nested loop simply remains the only path, so planning cannot
+ * fail.
+ *
+ * Two prices are paid for that.  add_paths_to_joinrel() runs twice for the
+ * joins we act on, so anything it does besides generating paths also happens
+ * twice; in particular GetForeignJoinPaths() is called a second time for a
+ * foreign join, which postgres_fdw tolerates by way of its fdw_private check
+ * but a third-party FDW need not.  And planning gets slower, in proportion to
+ * how often the module fires - which, with no row threshold, is most joins
+ * that have a plain nested loop at all.  Measure it before turning this on.
+ *
+ * Load it with
  *		LOAD 'enforce_workers';
- * and set nlguard.mode = log; it does nothing by default.
+ * and turn it on with nlguard.mode; it does nothing by default.
  *
  *-------------------------------------------------------------------------
  */
@@ -49,6 +79,7 @@
 
 #include "nodes/bitmapset.h"
 #include "nodes/pathnodes.h"
+#include "optimizer/cost.h"
 #include "optimizer/paths.h"
 #include "utils/guc.h"
 
@@ -57,12 +88,14 @@
 typedef enum NlguardMode
 {
 	NLGUARD_OFF = 0,			/* do nothing at all */
-	NLGUARD_LOG					/* evaluate and report, change no plan */
+	NLGUARD_LOG,				/* evaluate and report, change no plan */
+	NLGUARD_ON					/* evaluate, report, and act */
 } NlguardMode;
 
 static const struct config_enum_entry nlguard_mode_options[] = {
 	{"off", NLGUARD_OFF, false},
 	{"log", NLGUARD_LOG, false},
+	{"on", NLGUARD_ON, false},
 	{NULL, 0, false}
 };
 
@@ -85,6 +118,13 @@ static int	nlguard_mode = NLGUARD_OFF;
 static int	nlguard_log_level = DEBUG1;
 
 static set_join_pathlist_hook_type prev_set_join_pathlist_hook = NULL;
+
+/*
+ * Set while we are inside our own call to add_paths_to_joinrel().  The core
+ * calls set_join_pathlist_hook at the end of every such call, so without this
+ * we would recurse until the stack ran out.
+ */
+static bool nlguard_regenerating = false;
 
 /* Enough for the relid sets that appear in a log line; longer sets truncate. */
 #define NLGUARD_RELIDS_BUFLEN	128
@@ -125,8 +165,8 @@ nlguard_format_relids(Relids relids, char *buf, int buflen)
 }
 
 /*
- * nlguard_should_report
- *		Is this nested loop the plain kind?
+ * nlguard_should_penalise
+ *		Is this nested loop the plain kind, the one we refuse?
  *
  * Everything this reads comes out of the path itself.  That is not a matter
  * of taste: add_paths_to_joinrel() runs once per pair of input relations for
@@ -139,7 +179,7 @@ nlguard_format_relids(Relids relids, char *buf, int buflen)
  * so.
  */
 static bool
-nlguard_should_report(NestPath *nl)
+nlguard_should_penalise(NestPath *nl)
 {
 	Path	   *inner = nl->jpath.innerjoinpath;
 	Relids		outer_relids;
@@ -196,7 +236,7 @@ nlguard_should_report(NestPath *nl)
 
 /*
  * nlguard_is_candidate
- *		Is this path one we should report?
+ *		Is this path one we should act on, and have we not already?
  *
  * outerrel and innerrel are the pair add_paths_to_joinrel() is currently
  * working on.
@@ -205,6 +245,7 @@ static bool
 nlguard_is_candidate(Path *path, RelOptInfo *outerrel, RelOptInfo *innerrel)
 {
 	NestPath   *nl;
+	int			undisturbed;
 
 	if (!IsA(path, NestPath))
 		return false;
@@ -212,15 +253,34 @@ nlguard_is_candidate(Path *path, RelOptInfo *outerrel, RelOptInfo *innerrel)
 	nl = (NestPath *) path;
 
 	/*
-	 * Only look at paths built by the current call, so that each one is
-	 * reported once rather than once per pair of input relations that can
-	 * form this joinrel.
+	 * Only touch paths built by the current call.  The alternatives we are
+	 * about to ask for are generated for this pair of input relations, so
+	 * acting on a path left over from another pair would penalise it without
+	 * rebuilding the alternative that would naturally replace it.  A path
+	 * from an earlier pair has already been through this on the call that
+	 * created it.
 	 */
 	if (!bms_equal(nl->jpath.outerjoinpath->parent->relids, outerrel->relids) ||
 		!bms_equal(nl->jpath.innerjoinpath->parent->relids, innerrel->relids))
 		return false;
 
-	return nlguard_should_report(nl);
+	/*
+	 * Skip a path that already carries a penalty.  initial_cost_nestloop()
+	 * sets disabled_nodes to the sum over the two input paths, plus one when
+	 * enable_nestloop is off, so anything above that sum was either penalised
+	 * by us or produced by our own regeneration pass.
+	 *
+	 * This also makes the module keep its hands off entirely when the user
+	 * has set enable_nestloop = off for the session: every nested loop is
+	 * then already above the sum, and there is nothing left for us to say.
+	 */
+	undisturbed = nl->jpath.outerjoinpath->disabled_nodes +
+		nl->jpath.innerjoinpath->disabled_nodes;
+
+	if (path->disabled_nodes > undisturbed)
+		return false;
+
+	return nlguard_should_penalise(nl);
 }
 
 /*
@@ -232,9 +292,20 @@ nlguard_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 						  RelOptInfo *outerrel, RelOptInfo *innerrel,
 						  JoinType jointype, JoinPathExtraData *extra)
 {
-	List	   *found = NIL;
+	List	   *victims = NIL;
 	ListCell   *lc;
+	bool		save_enable_nestloop;
 	char		relidbuf[NLGUARD_RELIDS_BUFLEN];
+
+	/*
+	 * Do nothing on the way back in from our own add_paths_to_joinrel() call.
+	 * The previous hook in the chain is skipped too: it has already been
+	 * shown this joinrel once, and showing it the same joinrel a second time
+	 * because of an internal pass of ours would be the more surprising of the
+	 * two behaviours.
+	 */
+	if (nlguard_regenerating)
+		return;
 
 	if (prev_set_join_pathlist_hook)
 		prev_set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
@@ -262,12 +333,18 @@ nlguard_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 	if (root->tuple_fraction != 0.0)
 		return;
 
+	/*
+	 * Collect first, act later.  add_path() deletes and pfrees the paths it
+	 * rejects, so the path lists must not be walked while they are being
+	 * modified, and nothing collected here may be dereferenced once
+	 * add_paths_to_joinrel() has run again below.
+	 */
 	foreach(lc, joinrel->pathlist)
 	{
 		Path	   *path = (Path *) lfirst(lc);
 
 		if (nlguard_is_candidate(path, outerrel, innerrel))
-			found = lappend(found, path);
+			victims = lappend(victims, path);
 	}
 
 	foreach(lc, joinrel->partial_pathlist)
@@ -275,10 +352,10 @@ nlguard_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 		Path	   *path = (Path *) lfirst(lc);
 
 		if (nlguard_is_candidate(path, outerrel, innerrel))
-			found = lappend(found, path);
+			victims = lappend(victims, path);
 	}
 
-	if (found == NIL)
+	if (victims == NIL)
 		return;
 
 	/*
@@ -290,7 +367,7 @@ nlguard_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 	 */
 	nlguard_format_relids(joinrel->relids, relidbuf, sizeof(relidbuf));
 
-	foreach(lc, found)
+	foreach(lc, victims)
 	{
 		NestPath   *nl = (NestPath *) lfirst(lc);
 
@@ -300,7 +377,8 @@ nlguard_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 		 * not reading numbers that shift with the statistics.
 		 */
 		ereport(nlguard_log_level,
-				(errmsg("nlguard: would penalise nested loop over join (%s)",
+				(errmsg("nlguard: %s nested loop over join (%s)",
+						(nlguard_mode == NLGUARD_ON) ? "penalising" : "would penalise",
 						relidbuf),
 				 errdetail("Outer rows %.0f, inner rows %.0f, total cost %.2f.",
 						   nl->jpath.outerjoinpath->rows,
@@ -308,7 +386,59 @@ nlguard_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 						   nl->jpath.path.total_cost)));
 	}
 
-	list_free(found);
+	if (nlguard_mode != NLGUARD_ON)
+	{
+		list_free(victims);
+		return;
+	}
+
+	/*
+	 * Penalise before regenerating.  An untouched nested loop would still
+	 * dominate the alternatives we are about to ask for, and add_path() would
+	 * throw them away again on arrival.
+	 */
+	foreach(lc, victims)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+
+		path->disabled_nodes++;
+	}
+
+	list_free(victims);
+	victims = NIL;
+
+	/*
+	 * Ask the core for the join paths a second time, with nested loops
+	 * disabled, so that the hash and merge paths discarded during the first
+	 * pass are rebuilt by the code that owns that job.  Duplicates of the
+	 * paths that are already present cost nothing: add_path() finds them
+	 * equal in cost, pathkeys and parameterisation, and rejects them.
+	 *
+	 * We assign to enable_nestloop directly rather than going through the GUC
+	 * machinery, which is what try_nestloop_path() reads and is all we need.
+	 * It does mean that anything executing SQL underneath this call - an FDW
+	 * callback, say - would both see and plan with nested loops off.
+	 *
+	 * The restore goes in PG_FINALLY rather than at the end of the block
+	 * because anything under add_paths_to_joinrel() may throw, and leaving a
+	 * planner GUC flipped would then affect every later statement in the
+	 * session.
+	 */
+	save_enable_nestloop = enable_nestloop;
+	enable_nestloop = false;
+	nlguard_regenerating = true;
+
+	PG_TRY();
+	{
+		add_paths_to_joinrel(root, joinrel, outerrel, innerrel, jointype,
+							 extra->sjinfo, extra->restrictlist);
+	}
+	PG_FINALLY();
+	{
+		enable_nestloop = save_enable_nestloop;
+		nlguard_regenerating = false;
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -320,7 +450,7 @@ nlguard_init(void)
 {
 	DefineCustomEnumVariable("nlguard.mode",
 							 "Controls how plain nested loops are treated.",
-							 "off leaves planning alone; log reports the joins that would be affected.",
+							 "off leaves planning alone; log reports the joins that would be affected; on penalises them and lets the planner rebuild the alternatives.",
 							 &nlguard_mode,
 							 NLGUARD_OFF,
 							 nlguard_mode_options,

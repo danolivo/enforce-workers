@@ -17,7 +17,7 @@ touching a single catalog row.
 
 ## nlguard
 
-Finds one shape of nested loop — the plain one: unparameterised, reading its
+Refuses one shape of nested loop — the plain one: unparameterised, reading its
 whole inner side once per outer row. The cost of such a loop is linear in the
 outer row count while the cost of the equivalent hash join is almost flat, so
 an N-fold underestimate of the outer side understates the nested loop by
@@ -45,17 +45,78 @@ the outer relation), which is the case Leis et al. exclude as well;
 `inner_unique` and SEMI/ANTI joins that stop after the first match; and
 anything under a LIMIT or a cursor.
 
+There is no row-count threshold, deliberately. A threshold would be a
+calibration against one workload dressed up as a rule, and the decision would
+rest on the very estimate whose reliability is in question.
+
+### How it acts
+
+`set_join_pathlist_hook` runs at the end of `add_paths_to_joinrel()`, after
+`add_path()` has already discarded the hash and merge paths that lost to the
+nested loop. Bumping `disabled_nodes` at that point would leave the joinrel
+with no alternative to fall back to.
+
+So instead the module penalises the nested loop and then calls
+`add_paths_to_joinrel()` again with `enable_nestloop = false`. The core
+rebuilds its own hash and merge paths, which are no longer dominated; the
+module carries no copy of `hash_inner_and_outer()` and nothing to re-sync each
+major release. If no alternative is possible the second pass adds nothing, the
+penalised loop stays, and planning still succeeds.
+
 ### GUCs
 
 | name | type | default | meaning |
 |---|---|---|---|
-| `nlguard.mode` | enum | `off` | `off` / `log` |
+| `nlguard.mode` | enum | `off` | `off` / `log` / `on` |
 | `nlguard.log_level` | enum | `debug1` | level for the report, as in `auto_explain` |
 
 `log` mode evaluates the rule and reports every join it matches, without
 changing a single plan. Raising `log_level` to `log` makes the logger process
 part of the measurement, so on a busy system prefer `debug1` with
 `log_min_messages` set for the duration of the run.
+
+The visible record of the module acting is `EXPLAIN`, which reports a
+penalised node as `Disabled: true` when it survives anyway.
+
+### Planning cost
+
+The second pass is not free. Measured on a PG 18.6 debug build, EXPLAIN-only
+pgbench, single client:
+
+| query | mode=off | mode=on | |
+|---|---|---|---|
+| 4-way, 3 joins matched | 3489 tps | 3399 tps | −2.6% |
+| 7-way chain, 4 joins matched | 1762 tps | 1568 tps | −11% |
+
+Measure your own workload before turning it on; the cost scales with how often
+the module fires, and without a row threshold it fires on most joins that have
+a plain nested loop at all.
+
+### Caveats
+
+* `add_paths_to_joinrel()` runs twice for the joins that match, so everything
+  it does besides generating paths happens twice — notably
+  `GetForeignJoinPaths()`. `postgres_fdw` guards against that with its
+  `fdw_private` check; a third-party FDW need not.
+* The policy reads the path, never the hook's arguments. `pathlist`
+  accumulates across the calls for different pairs of input relations, so a
+  path is judged by its own outer relation and its own `inner_unique`. Judging
+  it by the current call's mistakes an index nested loop for a plain one; a
+  7-way join flags 14 paths that way instead of 3.
+* Penalising a path in place means a loop pardoned on one call for a joinrel
+  competes on later calls against loops of a different join order that have
+  not been evaluated yet. There is no hook between the last
+  `add_paths_to_joinrel()` for a joinrel and `set_cheapest()`, so this cannot
+  be fixed from an extension.
+* `disabled_nodes` outranks cost outright, so there is no upper bound on how
+  much worse the replacement plan can be. A guard on the absolute size of the
+  inner side would be the obvious next thing to add — not one on the cost
+  ratio, which would be computed from the very estimates in question.
+* `nlguard.mode = off` by default, so loading the library for
+  `enforce_workers` alone changes no join method.
+* Setting `enable_nestloop = off` for the session disables the module
+  implicitly: every nested loop already carries a penalty and it finds nothing
+  to act on.
 
 ## Build
 
