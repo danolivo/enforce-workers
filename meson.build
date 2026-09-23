@@ -3,6 +3,7 @@
 enforce_workers_sources = files(
   'enforce_workers.c',
   'nlguard.c',
+  'seqguard.c',
 )
 
 if host_system == 'windows'
@@ -17,6 +18,12 @@ enforce_workers = shared_module('enforce_workers',
 )
 contrib_targets += enforce_workers
 
+install_data(
+  'enforce_workers.control',
+  'enforce_workers--1.0.sql',
+  kwargs: contrib_data_args,
+)
+
 tests += {
   'name': 'enforce_workers',
   'sd': meson.current_source_dir(),
@@ -24,6 +31,7 @@ tests += {
   'regress': {
     'sql': [
       'nlguard',
+      'seqguard',
     ],
   },
 }

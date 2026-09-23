@@ -2,7 +2,8 @@
 
 Two unrelated planner overrides in one loadable module: `enforce_workers`
 below, and `nlguard` further down. Each lives in its own file and can be
-switched off independently; `_PG_init()` is the only entry point.
+switched off independently; `_PG_init()` is the only entry point. The module
+also installs one SQL function, `seqguard_nextval()`, described at the end.
 
 **Both are active the moment the library is loaded.** `enforce_workers` has no
 switch at all, and `nlguard.mode` defaults to `on`. Loading this library
@@ -175,6 +176,88 @@ pass to find out.
 * `log` mode changing no plan;
 * the rewritten plans returning the same rows as the originals.
 
+## seqguard_nextval()
+
+A stand-in for `nextval(regclass)` that a query may call while a Gather is
+open, for the one case where that is sound: a temporary sequence belonging to
+this session.
+
+`nextval()` is `PROPARALLEL_UNSAFE`, and `standard_planner()` takes the worst
+hazard anywhere in a `Query` and applies it to all of it:
+
+    glob->maxParallelHazard = max_parallel_hazard(parse);
+    glob->parallelModeOK = (glob->maxParallelHazard != PROPARALLEL_UNSAFE);
+
+So a single call — the one a `serial` column's default puts into the source
+query of an `INSERT` — disables parallelism for the scans, sorts and joins
+underneath it that never touch the sequence.
+
+### Why the marking cannot simply be relaxed
+
+Two independent reasons, and only the first is about workers:
+
+1. Sequence values come from a backend-local cache (`SeqTableData` in
+   `sequence.c`). Nothing about it is shared, so a worker cannot take part.
+2. Parallel mode is a blanket read-only regime. `nextval_internal()` enforces
+   it with `PreventCommandIfParallelMode()`, which tests `IsInParallelMode()` —
+   true in the **leader** too, for as long as a Gather is open. `PARALLEL
+   RESTRICTED` would place the call above every Gather, which is what the
+   planner needs, and it would still fail at run time.
+
+### Why a temporary sequence is different
+
+The regime exists to stop state the workers share with the leader from moving
+underneath them. Advancing a temporary sequence moves nothing they can see:
+
+* **No WAL.** `RelationNeedsWAL()` is false, so `nextval_internal()` skips both
+  the `XLogInsert()` and the `GetTopTransactionId()` that guards it. The second
+  matters on its own — `AssignTransactionId()` refuses to run in parallel mode,
+  so a *permanent* sequence would fail there even if the first check were
+  lifted. That is why this function never takes its own path for one.
+* **No transaction id, no command id.** Sequences are non-transactional.
+* **Local buffers**, which belong to one backend.
+* **Unreachable from below a Gather.** The value is visible only through
+  `nextval()`, `currval()` and `lastval()`, none of them parallel-safe, or by
+  scanning the sequence relation — and a sequence never gets a partial path, so
+  that scan is never parallel either.
+
+### Behaviour
+
+Outside parallel mode the function *is* `nextval()`: it calls
+`nextval_internal()`, so the cache, the values, `currval()` and `lastval()` are
+exactly what they would have been. Only with a Gather open does it take its own
+path, and there it re-checks `rd_islocaltemp` first and hands anything else
+back to the core — which raises the same error it always would.
+
+### Caveats
+
+* The private path does not cache unissued values, so it takes one value per
+  call, as `CACHE 1` does. Two consequences, and only for a session that runs a
+  parallel query over a temporary sequence:
+  * `currval()` and `lastval()` do not see the values it produced;
+  * if the core had already cached a block for the same sequence, values handed
+    out afterwards are not ascending. They are still **unique** — the core owns
+    its block exclusively and this path takes values beyond the end of it — and
+    sequences promise no ordering across cached blocks anyway. A sequence with
+    `CACHE 1`, which is the default and what a `serial` column gets, has no
+    block to diverge from.
+* Writing the page sets `log_cnt = 0`, which is honest for a relation that
+  writes no WAL but makes the core's next `nextval()` on that sequence take its
+  "must log" branch and fetch `SEQ_LOG_VALS` = 32 values ahead. Alternating
+  between the two paths therefore burns 32 values per switch.
+
+### Tests
+
+`sql/seqguard.sql` calls the function directly in a `SELECT` that does go
+parallel, and covers:
+
+* 20 000 values — one per row, no duplicates, no gaps;
+* the guard: a permanent sequence inside parallel mode is handed back to the
+  core, which raises `cannot execute nextval() during a parallel operation`;
+* outside parallel mode, plain `nextval()` behaviour including `currval()`;
+* the documented `currval()` limitation, and the sequence having advanced
+  anyway.
+
 ## Build
 
 In-tree:
@@ -189,14 +272,19 @@ With meson, add `subdir('enforce-workers')` to `contrib/meson.build` first.
 
 ## Use
 
-There are no SQL objects, so no `CREATE EXTENSION`:
+Load the library:
 
     LOAD 'enforce_workers';
 
 or put `enforce_workers` in `session_preload_libraries` or
-`shared_preload_libraries`.
+`shared_preload_libraries`. Both planner overrides take effect immediately.
 
-Both overrides take effect immediately. To load the library for one of them
+`seqguard_nextval()` needs one more step, per database, because it is an SQL
+function and has to exist in `pg_proc`:
+
+    CREATE EXTENSION enforce_workers;
+
+Nothing else in the module depends on it. To load the library for one override
 only:
 
     LOAD 'enforce_workers';
