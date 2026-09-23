@@ -86,6 +86,28 @@ INSERT INTO sg_tmp_dst (a) SELECT a FROM sg_src;
 
 SET seqguard.mode = on;
 
+--
+-- The rewrite is made in place, which is only safe if nothing we write
+-- outlives the plan it was written for.  A prepared statement is the one thing
+-- that plans the same tree more than once, so plan it three times and watch:
+-- the report comes every time, because BuildCachedPlan() hands the planner a
+-- copy and keeps its own tree with nextval() in it.
+--
+-- force_custom_plan is not decoration.  With no parameter the statement would
+-- get a generic plan built once and reused, and one report would prove nothing
+-- either way.
+--
+SET plan_cache_mode = force_custom_plan;
+
+PREPARE sg_p(int) AS INSERT INTO sg_tmp_dst (a) SELECT a FROM sg_src WHERE a < $1;
+
+EXPLAIN (COSTS OFF) EXECUTE sg_p(0);
+EXPLAIN (COSTS OFF) EXECUTE sg_p(0);
+EXPLAIN (COSTS OFF) EXECUTE sg_p(0);
+
+DEALLOCATE sg_p;
+RESET plan_cache_mode;
+
 DROP TABLE sg_conf_dst;
 
 \set VERBOSITY default
