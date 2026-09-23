@@ -1,0 +1,5 @@
+# enforce_workers extension
+comment = 'planner overrides for parallelism and nested loops'
+default_version = '1.0'
+module_pathname = '$libdir/enforce_workers'
+relocatable = true
