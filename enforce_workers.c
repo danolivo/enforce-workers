@@ -19,10 +19,15 @@
  *		LOAD 'enforce_workers';
  * or by listing it in session_preload_libraries / shared_preload_libraries.
  *
- * The module has grown a second, unrelated planner tweak in nlguard.c.  Each
- * feature keeps to its own file and exposes one initialiser; _PG_init() at
- * the bottom of this file is the only entry point and the only place that
- * decides what gets installed.
+ * The module has grown two further, unrelated planner tweaks, in nlguard.c and
+ * seqguard.c.  Each feature keeps to its own file and exposes one initialiser;
+ * _PG_init() at the bottom of this file is the only entry point and the only
+ * place that decides what gets installed.
+ *
+ * seqguard is the one feature with an SQL half: its replacement function has
+ * to exist in pg_proc for the planner to point a call at it.  Loading the
+ * library is still enough for everything else, and seqguard simply does
+ * nothing in a database where CREATE EXTENSION has not been run.
  *
  *-------------------------------------------------------------------------
  */
@@ -88,4 +93,5 @@ _PG_init(void)
 {
 	enforce_workers_init();
 	nlguard_init();
+	seqguard_init();
 }

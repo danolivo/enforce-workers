@@ -3,9 +3,10 @@
  * enforce_workers.h
  *		Internal header for the enforce_workers module.
  *
- * The module installs no SQL objects and exports nothing, so this header is
- * not installed.  It exists only so that _PG_init() in enforce_workers.c can
- * reach the per-feature initialisers that live in the other files.
+ * The module's SQL footprint is one function, installed by CREATE EXTENSION
+ * and used only by seqguard.c, so this header is not installed.  It exists
+ * only so that _PG_init() in enforce_workers.c can reach the per-feature
+ * initialisers that live in the other files.
  *
  *-------------------------------------------------------------------------
  */
@@ -14,5 +15,8 @@
 
 /* nlguard.c */
 extern void nlguard_init(void);
+
+/* seqguard.c */
+extern void seqguard_init(void);
 
 #endif							/* ENFORCE_WORKERS_H */

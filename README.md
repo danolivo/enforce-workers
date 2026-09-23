@@ -1,14 +1,18 @@
 # enforce_workers
 
-Two unrelated planner overrides in one loadable module: `enforce_workers`
-below, and `nlguard` further down. Each lives in its own file and can be
-switched off independently; `_PG_init()` is the only entry point. The module
-also installs one SQL function, `seqguard_nextval()`, described at the end.
+Three unrelated planner overrides in one loadable module: `enforce_workers`
+below, then `nlguard`, then `seqguard`. Each lives in its own file and can be
+switched off independently; `_PG_init()` is the only entry point.
 
-**Both are active the moment the library is loaded.** `enforce_workers` has no
-switch at all, and `nlguard.mode` defaults to `on`. Loading this library
-changes plans — that is what it is for — so do not put it in
-`shared_preload_libraries` of a server you have not measured it on.
+**All three are active the moment the library is loaded.** `enforce_workers`
+has no switch at all, and both `nlguard.mode` and `seqguard.mode` default to
+`on`. Loading this library changes plans — that is what it is for — so do not
+put it in `shared_preload_libraries` of a server you have not measured it on.
+
+`seqguard` additionally needs `CREATE EXTENSION enforce_workers` in each
+database where it should work, because it substitutes a function and that
+function has to exist in `pg_proc`. Without it the feature is inert; the other
+two are unaffected.
 
 ## enforce_workers
 
@@ -176,21 +180,25 @@ pass to find out.
 * `log` mode changing no plan;
 * the rewritten plans returning the same rows as the originals.
 
-## seqguard_nextval()
+## seqguard
 
-A stand-in for `nextval(regclass)` that a query may call while a Gather is
-open, for the one case where that is sound: a temporary sequence belonging to
-this session.
+Stops one `nextval()` on a temporary sequence from costing a whole query its
+parallelism.
 
-`nextval()` is `PROPARALLEL_UNSAFE`, and `standard_planner()` takes the worst
-hazard anywhere in a `Query` and applies it to all of it:
+A table with a sequence default — a `serial` column, an identity column, an
+explicit `DEFAULT nextval(...)` — gets that expression expanded into the source
+query of any `INSERT` that omits the column. `nextval()` is marked
+`PROPARALLEL_UNSAFE`, and `standard_planner()` takes the worst hazard anywhere
+in the `Query` and applies it to all of it:
 
     glob->maxParallelHazard = max_parallel_hazard(parse);
     glob->parallelModeOK = (glob->maxParallelHazard != PROPARALLEL_UNSAFE);
 
-So a single call — the one a `serial` column's default puts into the source
-query of an `INSERT` — disables parallelism for the scans, sorts and joins
-underneath it that never touch the sequence.
+So a single call in the topmost target list disables parallelism for the scans,
+sorts and joins underneath it that never touch the sequence. This is the shape
+1C produces for nearly every intermediate result: a temporary table with a
+serial column, filled by `INSERT ... SELECT`, where the `SELECT` is all of the
+work.
 
 ### Why the marking cannot simply be relaxed
 
@@ -221,16 +229,56 @@ underneath them. Advancing a temporary sequence moves nothing they can see:
   scanning the sequence relation — and a sequence never gets a partial path, so
   that scan is never parallel either.
 
-### Behaviour
+### How it acts
 
-Outside parallel mode the function *is* `nextval()`: it calls
-`nextval_internal()`, so the cache, the values, `currval()` and `lastval()` are
-exactly what they would have been. Only with a Gather open does it take its own
-path, and there it re-checks `rd_islocaltemp` first and hands anything else
-back to the core — which raises the same error it always would.
+`proparallel` is a catalog property read long before any hook could intervene,
+and `prosupport` is too late: `SupportRequestSimplify` runs from
+`eval_const_expressions()` inside `subquery_planner()`, below the hazard scan,
+which says so itself — *"parallelModeOK can't change after this point"*.
+
+The one place early enough is `planner_hook`, in two steps.
+
+**The gate.** Is this an `INSERT` into a temporary table of this backend? Almost
+every statement is rejected on `commandType` alone; the rest costs one
+`list_nth()` and one syscache lookup. Only what survives is walked. This is a
+deliberate narrowing — a plain `SELECT` calling `nextval()` on a temporary
+sequence keeps losing its parallelism, as it does today — and it is what keeps
+a tree walk off a workload that plans thousands of statements a minute.
+
+**The walk.** Find `nextval()` calls whose argument is a `Const` naming a
+sequence that is temporary and belongs to this backend — all known at plan
+time, because the rewriter plants the sequence OID as a constant when it
+expands a column default — and point them at `seqguard_nextval()`.
+`standard_planner()` then sees a restricted hazard instead of an unsafe one,
+allows parallel paths, and keeps the call above every Gather.
+
+The rewrite goes into the caller's `Query` rather than a copy: `copyObject()`
+on a 1C `INSERT ... SELECT` tree, once per planning cycle, to change one `Oid`
+per call site, is not a good trade. It is safe because it is idempotent — the
+next planning cycle finds our function instead of `nextval()` and does nothing
+— and because the fact that decided it, the target being a temporary table of
+this session, cannot change underneath a cached plan.
+
+At run time `seqguard_nextval()` delegates to `nextval_internal()` whenever it
+is not in parallel mode — same cache, same values, same `currval()`. Only with
+a Gather open does it take its own path, and there it re-checks
+`rd_islocaltemp` before touching anything.
+
+### GUCs
+
+| GUC | Default | Meaning |
+| --- | --- | --- |
+| `seqguard.mode` | `on` | `off` leaves planning alone; `log` reports the calls that would be substituted; `on` substitutes. |
+| `seqguard.log_level` | `debug1` | Level at which substituted calls are reported. |
 
 ### Caveats
 
+* Requires `CREATE EXTENSION enforce_workers` in the database. Without it the
+  module says so once per statement with a candidate call (at
+  `seqguard.log_level`) and plans normally.
+* **Only `INSERT` into a temporary table is considered.** A `SELECT`, an
+  `UPDATE`, or an `INSERT` into a permanent table never reaches the walk — see
+  the gate above.
 * The private path does not cache unissued values, so it takes one value per
   call, as `CACHE 1` does. Two consequences, and only for a session that runs a
   parallel query over a temporary sequence:
@@ -245,18 +293,49 @@ back to the core — which raises the same error it always would.
   writes no WAL but makes the core's next `nextval()` on that sequence take its
   "must log" branch and fetch `SEQ_LOG_VALS` = 32 values ahead. Alternating
   between the two paths therefore burns 32 values per switch.
+* A permanent sequence is never substituted, for the `GetTopTransactionId()`
+  reason above. Another session's temporary sequence is never substituted
+  either; `rd_islocaltemp` / `isTempNamespace()` is what tells the two apart.
+* A computed `nextval()` argument is left alone — it may name a different
+  sequence on every row, so there is no plan-time answer.
+* The rewrite is in place, so `seqguard.mode = off` does not un-rewrite a
+  statement that was already planned and cached, and a cached statement
+  rewritten before `DROP EXTENSION` refers to a function that is gone.
+  Re-preparing, or reconnecting, answers both.
+* **A plain `INSERT` does not become parallel just because this ran.**
+  `standard_planner()` also requires `parse->commandType == CMD_SELECT`; the
+  patch that lifted that (`05c8482f7f`) was reverted two weeks later by
+  `26acb54a13` and never shipped. On community PostgreSQL the substitution is
+  therefore visible in `EXPLAIN` and changes no plan. This module is aimed at a
+  build that does allow a parallel `SELECT` underneath an `INSERT`.
 
 ### Tests
 
-`sql/seqguard.sql` calls the function directly in a `SELECT` that does go
-parallel, and covers:
+`sql/seqguard.sql` covers the planner and the run time separately, because on
+community PostgreSQL no `INSERT` will open a Gather for us.
+
+Planner:
+
+* `INSERT` into a temporary table with a `serial` column — substituted, and
+  visible as `seqguard_nextval(...)` in `EXPLAIN VERBOSE`;
+* `INSERT` into a permanent table — rejected by the gate;
+* `INSERT` into a temporary table whose default uses a *permanent* sequence —
+  passes the gate, rejected per call;
+* a plain `SELECT` calling `nextval()` — rejected by the gate, which is the
+  documented narrowing;
+* `log` mode reporting and changing nothing.
+
+Run time, reached by calling the function directly in a `SELECT` that does go
+parallel:
 
 * 20 000 values — one per row, no duplicates, no gaps;
 * the guard: a permanent sequence inside parallel mode is handed back to the
   core, which raises `cannot execute nextval() during a parallel operation`;
 * outside parallel mode, plain `nextval()` behaviour including `currval()`;
+* a `serial` column on a temporary table behaving as before;
 * the documented `currval()` limitation, and the sequence having advanced
-  anyway.
+  anyway;
+* the feature going inert, not broken, after `DROP EXTENSION`.
 
 ## Build
 
@@ -277,18 +356,18 @@ Load the library:
     LOAD 'enforce_workers';
 
 or put `enforce_workers` in `session_preload_libraries` or
-`shared_preload_libraries`. Both planner overrides take effect immediately.
+`shared_preload_libraries`. All three overrides take effect immediately.
 
-`seqguard_nextval()` needs one more step, per database, because it is an SQL
-function and has to exist in `pg_proc`:
+`seqguard` needs one more step, per database, because it points query trees at
+a function that has to exist:
 
     CREATE EXTENSION enforce_workers;
 
-Nothing else in the module depends on it. To load the library for one override
-only:
+To load the library for one override only:
 
     LOAD 'enforce_workers';
-    SET nlguard.mode = off;          -- parallelism override only
+    SET nlguard.mode = off;          -- and leave seqguard.mode alone, or
+    SET seqguard.mode = off;         -- parallelism override only
 
 `enforce_workers` has no equivalent switch; unload the library to be rid of
 it.
