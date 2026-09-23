@@ -264,6 +264,17 @@ is not in parallel mode — same cache, same values, same `currval()`. Only with
 a Gather open does it take its own path, and there it re-checks
 `rd_islocaltemp` before touching anything.
 
+That private path keeps its own per-sequence table, the counterpart of
+`SeqTableData` in `sequence.c`, holding two things: whether the relation lock
+has already been taken in this transaction, and the parameters from
+`pg_sequence`. Without it every call would go through `LockRelationOid()`,
+`relation_open()` and a syscache lookup — once per row, in the leader, above a
+Gather, which is the one place in the plan where serial work hurts most. The
+lock is charged to `TopTransactionResourceOwner`, as the core charges it and
+for the same reason. What is **not** cached is unissued values: that would open
+gaps, widen the `currval()` divergence below, and buy nothing where the
+sequence behind a `serial` column has `CACHE 1` anyway.
+
 ### GUCs
 
 | GUC | Default | Meaning |
@@ -332,6 +343,7 @@ parallel:
 * the guard: a permanent sequence inside parallel mode is handed back to the
   core, which raises `cannot execute nextval() during a parallel operation`;
 * outside parallel mode, plain `nextval()` behaviour including `currval()`;
+* cached parameters following `ALTER SEQUENCE ... INCREMENT BY`;
 * a `serial` column on a temporary table behaving as before;
 * the documented `currval()` limitation, and the sequence having advanced
   anyway;

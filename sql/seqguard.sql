@@ -109,6 +109,18 @@ SELECT seqguard_nextval('sg_perm_seq') FROM sg_src ORDER BY b, a LIMIT 1;
 SELECT seqguard_nextval('sg_perm_seq');
 SELECT currval('sg_perm_seq');
 
+-- The parameters the private path caches follow ALTER SEQUENCE.  Every option
+-- that affects future values forces a rewrite, so the relfilenumber test in
+-- seqguard_nextval_local() sees it; the pg_sequence syscache callback would
+-- catch it too.
+ALTER SEQUENCE sg_tmp_dst_id_seq INCREMENT BY 10;
+SELECT setval('sg_tmp_dst_id_seq', 1, false);
+
+SELECT min(n), max(n)
+FROM (SELECT seqguard_nextval('sg_tmp_dst_id_seq') AS n FROM sg_src ORDER BY b, a) s;
+
+ALTER SEQUENCE sg_tmp_dst_id_seq INCREMENT BY 1;
+
 --
 -- Part 3: the whole thing end to end, and the documented limitation.
 --

@@ -150,6 +150,7 @@
 #include "access/parallel.h"
 #include "access/sequence.h"
 #include "access/xact.h"
+#include "common/relpath.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_proc.h"
@@ -163,13 +164,17 @@
 #include "parser/parse_func.h"
 #include "parser/parsetree.h"
 #include "storage/bufmgr.h"
+#include "storage/lmgr.h"
+#include "storage/proc.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
+#include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/resowner.h"
 #include "utils/syscache.h"
 
 #include "enforce_workers.h"
@@ -552,25 +557,175 @@ seqguard_planner(Query *parse, const char *query_string, int cursorOptions,
 }
 
 /*
+ * Per-sequence state, the counterpart of SeqTableData in sequence.c.
+ *
+ * What is cached here is deliberately *not* the same thing.  The core caches
+ * unissued values, which is what the sequence's CACHE setting controls; this
+ * caches only the two things that make a call cheap and have nothing to do
+ * with the values:
+ *
+ *   - whether the relation lock has already been taken in this transaction;
+ *   - the parameters from pg_sequence, which change only under ALTER SEQUENCE.
+ *
+ * Caching values as well is not an oversight.  It would open gaps in the
+ * numbering, widen the currval() divergence documented at the top of this
+ * file, and buy nothing for the workload this exists for, where the sequence
+ * behind a serial column has CACHE 1 and the core takes one value per call
+ * too.  If a sequence with CACHE > 1 ever turns up in a profile, that is the
+ * moment to revisit it - with a measurement.
+ *
+ * Entries live for the life of the backend, as the core's do.  DISCARD
+ * SEQUENCES needs no hook here for the same reason: it exists to forget cached
+ * values and currval() state, and this table holds neither.
+ */
+typedef struct SeqguardSeqEntry
+{
+	Oid			relid;			/* hash key - must be first */
+	LocalTransactionId lxid;	/* lock already held in this transaction? */
+	RelFileNumber filenumber;	/* to notice a sequence rewritten under us */
+	bool		params_valid;
+	int64		incby;
+	int64		maxv;
+	int64		minv;
+	bool		cycle;
+} SeqguardSeqEntry;
+
+static HTAB *seqguard_seqhash = NULL;
+
+/*
+ * seqguard_seq_invalidate
+ *		Drop the cached pg_sequence parameters.
+ *
+ * ALTER SEQUENCE forces a rewrite for every option that affects the values it
+ * will generate, so the relfilenumber test in seqguard_nextval_local() would
+ * catch those on its own.  This callback is the belt to that pair of braces:
+ * it costs nothing at run time and means the cache does not depend on that
+ * property of init_params() staying true.
+ */
+static void
+seqguard_seq_invalidate(Datum arg, int cacheid, uint32 hashvalue)
+{
+	HASH_SEQ_STATUS status;
+	SeqguardSeqEntry *entry;
+
+	if (seqguard_seqhash == NULL)
+		return;
+
+	hash_seq_init(&status, seqguard_seqhash);
+	while ((entry = (SeqguardSeqEntry *) hash_seq_search(&status)) != NULL)
+		entry->params_valid = false;
+}
+
+/*
+ * seqguard_seq_lock
+ *		Find the cache entry for this sequence, holding its lock.
+ *
+ * This is lock_and_open_sequence() without the open.  Taking RowExclusiveLock
+ * on every call - which is what a straightforward implementation does, because
+ * sequence_open() offers to do it for you - would put a lock manager
+ * acquisition on a path that runs once per row, in the leader, above a Gather.
+ * The core does not do that, and the reason it does not is this flag.
+ *
+ * The lock is charged to TopTransactionResourceOwner rather than to whatever
+ * owner happens to be current, exactly as the core does and for the same
+ * reason: the entry claims the lock is held for the whole transaction, so it
+ * must not be released when some portal or executor resource owner goes away.
+ * Nothing restores CurrentResourceOwner if LockRelationOid() throws, and that
+ * is fine for the same reason it is fine in the core - the error aborts the
+ * (sub)transaction, which resets it.
+ */
+static SeqguardSeqEntry *
+seqguard_seq_lock(Oid relid)
+{
+	SeqguardSeqEntry *entry;
+	bool		found;
+	LocalTransactionId thislxid = MyProc->vxid.lxid;
+
+	if (seqguard_seqhash == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(SeqguardSeqEntry);
+
+		seqguard_seqhash = hash_create("seqguard sequences", 16, &ctl,
+									   HASH_ELEM | HASH_BLOBS);
+	}
+
+	entry = (SeqguardSeqEntry *) hash_search(seqguard_seqhash, &relid,
+											 HASH_ENTER, &found);
+
+	if (!found)
+	{
+		entry->lxid = InvalidLocalTransactionId;
+		entry->filenumber = InvalidRelFileNumber;
+		entry->params_valid = false;
+	}
+
+	if (entry->lxid != thislxid)
+	{
+		ResourceOwner currentOwner;
+
+		currentOwner = CurrentResourceOwner;
+		CurrentResourceOwner = TopTransactionResourceOwner;
+
+		LockRelationOid(relid, RowExclusiveLock);
+
+		CurrentResourceOwner = currentOwner;
+
+		entry->lxid = thislxid;
+	}
+
+	return entry;
+}
+
+/*
+ * seqguard_load_params
+ *		Refresh the cached pg_sequence parameters for this entry.
+ */
+static void
+seqguard_load_params(SeqguardSeqEntry *entry)
+{
+	HeapTuple	pgstuple;
+	Form_pg_sequence pgsform;
+
+	pgstuple = SearchSysCache1(SEQRELID, ObjectIdGetDatum(entry->relid));
+	if (!HeapTupleIsValid(pgstuple))
+		elog(ERROR, "cache lookup failed for sequence %u", entry->relid);
+
+	pgsform = (Form_pg_sequence) GETSTRUCT(pgstuple);
+	entry->incby = pgsform->seqincrement;
+	entry->maxv = pgsform->seqmax;
+	entry->minv = pgsform->seqmin;
+	entry->cycle = pgsform->seqcycle;
+	/* seqcache is deliberately not honoured; see SeqguardSeqEntry. */
+
+	ReleaseSysCache(pgstuple);
+
+	entry->params_valid = true;
+}
+
+/*
  * seqguard_nextval_local
  *		Advance a temporary sequence without consulting parallel mode.
  *
- * A stripped-down nextval_internal(): no backend-local cache, and none of the
- * WAL machinery, because RelationNeedsWAL() is false for every relation that
- * reaches this point and the whole logging branch would be dead code.  The
- * arithmetic, the bounds handling and the buffer protocol are kept in the same
- * shape as the original so that the two can be compared side by side.
+ * A stripped-down nextval_internal(): no cache of unissued values, and none of
+ * the WAL machinery, because RelationNeedsWAL() is false for every relation
+ * that reaches this point and the whole logging branch would be dead code.
+ * The arithmetic, the bounds handling and the buffer protocol are kept in the
+ * same shape as the original so that the two can be compared side by side.
+ *
+ * The caller has already taken the lock through seqguard_seq_lock() and opened
+ * the relation, and has established that it is a local temporary sequence.
  */
 static int64
-seqguard_nextval_local(Relation seqrel)
+seqguard_nextval_local(Relation seqrel, SeqguardSeqEntry *entry)
 {
 	Buffer		buf;
 	Page		page;
 	ItemId		lp;
 	HeapTupleData seqtuple;
 	Form_pg_sequence_data seq;
-	HeapTuple	pgstuple;
-	Form_pg_sequence pgsform;
 	uint32	   *magic;
 	int64		incby,
 				maxv,
@@ -578,18 +733,26 @@ seqguard_nextval_local(Relation seqrel)
 				next;
 	bool		cycle;
 
-	pgstuple = SearchSysCache1(SEQRELID, ObjectIdGetDatum(RelationGetRelid(seqrel)));
-	if (!HeapTupleIsValid(pgstuple))
-		elog(ERROR, "cache lookup failed for sequence %u",
-			 RelationGetRelid(seqrel));
-	pgsform = (Form_pg_sequence) GETSTRUCT(pgstuple);
-	incby = pgsform->seqincrement;
-	maxv = pgsform->seqmax;
-	minv = pgsform->seqmin;
-	cycle = pgsform->seqcycle;
-	ReleaseSysCache(pgstuple);
+	/*
+	 * A sequence replaced transactionally - ALTER SEQUENCE, or a TRUNCATE of
+	 * an owning table - gets a new relfilenumber, and the parameters cached
+	 * against the old one may describe something else entirely.  The core
+	 * makes the same test for the same reason, one line further on in
+	 * init_sequence().
+	 */
+	if (seqrel->rd_rel->relfilenode != entry->filenumber)
+	{
+		entry->filenumber = seqrel->rd_rel->relfilenode;
+		entry->params_valid = false;
+	}
 
-	/* seqcache is read but not honoured; see the header comment. */
+	if (!entry->params_valid)
+		seqguard_load_params(entry);
+
+	incby = entry->incby;
+	maxv = entry->maxv;
+	minv = entry->minv;
+	cycle = entry->cycle;
 
 	buf = ReadBuffer(seqrel, 0);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
@@ -690,6 +853,7 @@ Datum
 seqguard_nextval(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
+	SeqguardSeqEntry *entry;
 	Relation	seqrel;
 	int64		result;
 
@@ -703,7 +867,9 @@ seqguard_nextval(PG_FUNCTION_ARGS)
 
 	Assert(!IsParallelWorker());
 
-	seqrel = sequence_open(relid, RowExclusiveLock);
+	/* Lock first, then open, in that order and for the reasons the core has. */
+	entry = seqguard_seq_lock(relid);
+	seqrel = sequence_open(relid, NoLock);
 
 	if (pg_class_aclcheck(relid, GetUserId(),
 						  ACL_USAGE | ACL_UPDATE) != ACLCHECK_OK)
@@ -729,7 +895,7 @@ seqguard_nextval(PG_FUNCTION_ARGS)
 		PG_RETURN_INT64(nextval_internal(relid, true));
 	}
 
-	result = seqguard_nextval_local(seqrel);
+	result = seqguard_nextval_local(seqrel, entry);
 
 	sequence_close(seqrel, NoLock);
 
@@ -766,6 +932,7 @@ seqguard_init(void)
 	MarkGUCPrefixReserved("seqguard");
 
 	CacheRegisterSyscacheCallback(PROCOID, seqguard_invalidate, (Datum) 0);
+	CacheRegisterSyscacheCallback(SEQRELID, seqguard_seq_invalidate, (Datum) 0);
 
 	prev_planner_hook = planner_hook;
 	planner_hook = seqguard_planner;
