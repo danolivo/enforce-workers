@@ -287,9 +287,9 @@ sequence behind a `serial` column has `CACHE 1` anyway.
 * Requires `CREATE EXTENSION enforce_workers` in the database. Without it the
   module says so once per statement with a candidate call (at
   `seqguard.log_level`) and plans normally.
-* **Only `INSERT` into a temporary table is considered.** A `SELECT`, an
-  `UPDATE`, or an `INSERT` into a permanent table never reaches the walk — see
-  the gate above.
+* **Only `INSERT` into a temporary table is considered**, and not one with `ON
+  CONFLICT`. A `SELECT`, an `UPDATE`, or an `INSERT` into a permanent table
+  never reaches the walk — see the gate above.
 * The private path does not cache unissued values, so it takes one value per
   call, as `CACHE 1` does. Two consequences, and only for a session that runs a
   parallel query over a temporary sequence:
@@ -309,10 +309,13 @@ sequence behind a `serial` column has `CACHE 1` anyway.
   either; `rd_islocaltemp` / `isTempNamespace()` is what tells the two apart.
 * A computed `nextval()` argument is left alone — it may name a different
   sequence on every row, so there is no plan-time answer.
-* The rewrite is in place, so `seqguard.mode = off` does not un-rewrite a
-  statement that was already planned and cached, and a cached statement
-  rewritten before `DROP EXTENSION` refers to a function that is gone.
-  Re-preparing, or reconnecting, answers both.
+* The run-time guard is a real test, not an `Assert`. `rd_islocaltemp` is true
+  in a parallel worker for the leader's temporary relations — `relcache.c` takes
+  `rd_backend` from `ProcNumberForTempRelations()`, which is the *leader's* proc
+  number there — so a worker that somehow reached the private path would advance
+  the leader's sequence in its own local buffer pool, silently. `PARALLEL
+  RESTRICTED` is a plan-time promise and a `PARALLEL SAFE` wrapper breaks it
+  without any malice, so the function checks at run time too.
 * **A plain `INSERT` does not become parallel just because this ran.**
   `standard_planner()` also requires `parse->commandType == CMD_SELECT`; the
   patch that lifted that (`05c8482f7f`) was reverted two weeks later by
@@ -334,14 +337,17 @@ Planner:
   passes the gate, rejected per call;
 * a plain `SELECT` calling `nextval()` — rejected by the gate, which is the
   documented narrowing;
+* `INSERT ... ON CONFLICT`, both forms — rejected by the gate;
 * `log` mode reporting and changing nothing.
 
 Run time, reached by calling the function directly in a `SELECT` that does go
 parallel:
 
 * 20 000 values — one per row, no duplicates, no gaps;
-* the guard: a permanent sequence inside parallel mode is handed back to the
-  core, which raises `cannot execute nextval() during a parallel operation`;
+* the guard, both halves: a permanent sequence inside parallel mode, and the
+  function reaching a worker through a `PARALLEL SAFE` plpgsql wrapper with
+  `parallel_leader_participation = off`. Both are handed back to the core,
+  which raises `cannot execute nextval() during a parallel operation`;
 * outside parallel mode, plain `nextval()` behaviour including `currval()`;
 * cached parameters following `ALTER SEQUENCE ... INCREMENT BY`;
 * a `serial` column on a temporary table behaving as before;

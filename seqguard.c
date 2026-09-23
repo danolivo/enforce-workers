@@ -376,6 +376,13 @@ seqguard_is_local_temp(Oid relid, char relkind)
  * A data-modifying CTE is not considered: the INSERT then sits inside a CTE
  * subquery rather than at parse->resultRelation, and standard_planner()
  * refuses parallelism for parse->hasModifyingCTE regardless of anything we do.
+ *
+ * ON CONFLICT is refused outright.  Everything this module reasons about
+ * concerns one target list - the INSERT's own, the one a column default is
+ * expanded into.  ON CONFLICT ... DO UPDATE brings a second set of expressions
+ * in onConflictSet, an arbitrary WHERE, and the speculative insertion protocol,
+ * none of which has been thought about here at all.  Refusing costs nothing:
+ * the statements this module exists for do not use it.
  */
 static bool
 seqguard_target_is_local_temp(Query *parse)
@@ -383,6 +390,9 @@ seqguard_target_is_local_temp(Query *parse)
 	RangeTblEntry *rte;
 
 	if (parse->commandType != CMD_INSERT)
+		return false;
+
+	if (parse->onConflict != NULL)
 		return false;
 
 	if (parse->resultRelation <= 0 ||
@@ -865,8 +875,6 @@ seqguard_nextval(PG_FUNCTION_ARGS)
 	if (!IsInParallelMode())
 		PG_RETURN_INT64(nextval_internal(relid, true));
 
-	Assert(!IsParallelWorker());
-
 	/* Lock first, then open, in that order and for the reasons the core has. */
 	entry = seqguard_seq_lock(relid);
 	seqrel = sequence_open(relid, NoLock);
@@ -885,11 +893,29 @@ seqguard_nextval(PG_FUNCTION_ARGS)
 	 * hand anything else back to the core - which raises exactly the error it
 	 * would have raised had we never intervened.
 	 *
-	 * rd_islocaltemp is precisely "temporary, and belonging to this session",
-	 * which is the property wanted; spelling it out as a persistence test plus
-	 * a backend comparison would only be a second copy of relcache's own rule.
+	 * rd_islocaltemp is not sufficient on its own, and reading it as
+	 * "temporary, and belonging to this session" is a trap.  relcache.c sets it
+	 * from ProcNumberForTempRelations(), which is
+	 *
+	 *		(ParallelLeaderProcNumber == INVALID_PROC_NUMBER ?
+	 *		 MyProcNumber : ParallelLeaderProcNumber)
+	 *
+	 * so in a parallel worker the leader's temporary relations come out with
+	 * rd_backend set to the leader and rd_islocaltemp true.  A worker reaching
+	 * this function would sail past that test, and RELATION_IS_OTHER_TEMP is
+	 * defined the same way, so ReadBuffer() would not stop it either: it would
+	 * read the leader's sequence page into its own local buffer pool, advance
+	 * it there, and hand out values nobody else knows about.  Duplicates, with
+	 * no error anywhere.
+	 *
+	 * PARALLEL RESTRICTED is what keeps the planner from putting the call in a
+	 * worker, and that is a promise made at plan time.  An Assert would hold
+	 * nobody to it in a production build, and it takes no malice to break it -
+	 * a PARALLEL SAFE wrapper around this function is enough.  So test for it.
 	 */
-	if (!seqrel->rd_islocaltemp)
+	if (IsParallelWorker() ||
+		!seqrel->rd_islocaltemp ||
+		seqrel->rd_backend != MyProcNumber)
 	{
 		sequence_close(seqrel, NoLock);
 		PG_RETURN_INT64(nextval_internal(relid, true));

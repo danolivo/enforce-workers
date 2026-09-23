@@ -66,6 +66,18 @@ INSERT INTO sg_mixed_dst (a) SELECT a FROM sg_src;
 EXPLAIN (COSTS OFF)
 SELECT nextval('sg_tmp_dst_id_seq'), a FROM sg_src ORDER BY b, a;
 
+-- ON CONFLICT is refused by the gate as well, whichever form it takes.  The
+-- module reasons about one target list and this brings a second one, along
+-- with the speculative insertion protocol.
+CREATE TEMP TABLE sg_conf_dst (id serial, a int UNIQUE);
+
+EXPLAIN (COSTS OFF)
+INSERT INTO sg_conf_dst (a) SELECT a FROM sg_src ON CONFLICT DO NOTHING;
+
+EXPLAIN (COSTS OFF)
+INSERT INTO sg_conf_dst (a) SELECT a FROM sg_src
+  ON CONFLICT (a) DO UPDATE SET a = excluded.a;
+
 -- log mode reports and changes nothing.
 SET seqguard.mode = log;
 
@@ -73,6 +85,8 @@ EXPLAIN (COSTS OFF)
 INSERT INTO sg_tmp_dst (a) SELECT a FROM sg_src;
 
 SET seqguard.mode = on;
+
+DROP TABLE sg_conf_dst;
 
 \set VERBOSITY default
 RESET seqguard.log_level;
@@ -102,6 +116,36 @@ EXPLAIN (COSTS OFF)
 SELECT seqguard_nextval('sg_perm_seq') FROM sg_src ORDER BY b, a LIMIT 1;
 
 SELECT seqguard_nextval('sg_perm_seq') FROM sg_src ORDER BY b, a LIMIT 1;
+
+--
+-- The other half of the guard: the function reaching a parallel *worker*.
+--
+-- PARALLEL RESTRICTED is what normally prevents that, and it is a promise made
+-- at plan time.  A PARALLEL SAFE wrapper breaks the promise without any malice,
+-- and the wrapper has to be plpgsql, because a SQL one would be inlined and the
+-- restricted marking would come back with it.
+--
+-- Getting this wrong would be silent.  In a worker the leader's temporary
+-- relations come out with rd_islocaltemp true - relcache.c takes rd_backend
+-- from ProcNumberForTempRelations(), which is the *leader's* proc number there
+-- - so a test on rd_islocaltemp alone lets the worker through, and
+-- RELATION_IS_OTHER_TEMP is defined the same way, so ReadBuffer() would not
+-- stop it either.  The worker would advance the leader's sequence in its own
+-- local buffer pool and hand out values nobody else knows about.
+--
+CREATE FUNCTION sg_par_safe(regclass) RETURNS bigint
+  LANGUAGE plpgsql PARALLEL SAFE AS $$ BEGIN RETURN seqguard_nextval($1); END $$;
+
+-- With the leader out of the way the call can only run in a worker.
+SET parallel_leader_participation = off;
+
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT sg_par_safe('sg_tmp_dst_id_seq') FROM sg_src WHERE a < 100;
+
+SELECT count(*) FROM (SELECT sg_par_safe('sg_tmp_dst_id_seq') FROM sg_src WHERE a < 100) s;
+
+RESET parallel_leader_participation;
+DROP FUNCTION sg_par_safe(regclass);
 
 -- Outside parallel mode the function is nextval(), cache and all - including
 -- for a permanent sequence, which the guard above only refuses while a Gather
