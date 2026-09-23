@@ -535,23 +535,21 @@ seqguard_planner(Query *parse, const char *query_string, int cursorOptions,
 			 * 1C's INSERT ... SELECT trees, and copyObject() would deep-copy
 			 * one per planning cycle to change a single Oid per call site.
 			 *
-			 * What the copy protected was a Query that gets planned more than
-			 * once - the query_list of a cached plan.  Rewriting that one in
-			 * place is safe here because the rewrite is idempotent and cannot
-			 * go stale: on the next planning cycle the walker finds our
-			 * function rather than nextval() and does nothing, and the fact
-			 * that decided the substitution - the target being a temporary
-			 * table of this session - cannot change underneath a cached plan.
-			 * A temporary table does not become permanent, and if it is
-			 * dropped the plan is invalidated with it.
+			 * It is also unnecessary, because scribbling on the Query is what
+			 * a planner is expected to do.  The one caller that plans the same
+			 * tree more than once says so itself, in BuildCachedPlan():
 			 *
-			 * Two consequences worth knowing.  Setting seqguard.mode = off
-			 * afterwards does not un-rewrite a statement that was already
-			 * planned; it still executes correctly, because outside parallel
-			 * mode the replacement *is* nextval(), but its plan keeps whatever
-			 * shape it was given.  And a cached statement rewritten before
-			 * DROP EXTENSION refers to a function that no longer exists.
-			 * Re-preparing it, or reconnecting, is the answer to both.
+			 *		If we don't already have a copy of the querytree list that
+			 *		can be scribbled on by the planner, make one.  For a
+			 *		one-shot plan, we assume it's okay to scribble on the
+			 *		original query_list.
+			 *
+			 * So a prepared statement hands us a fresh copy on every planning
+			 * cycle and keeps its own tree with nextval() in it, and a simple
+			 * query hands us a tree the parser built for this execution alone.
+			 * Nothing we write here outlives the plan it was written for -
+			 * which also means seqguard.mode = off takes effect on the next
+			 * planning cycle, with nothing left behind to undo.
 			 */
 			ctx.apply = true;
 

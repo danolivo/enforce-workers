@@ -254,10 +254,17 @@ allows parallel paths, and keeps the call above every Gather.
 
 The rewrite goes into the caller's `Query` rather than a copy: `copyObject()`
 on a 1C `INSERT ... SELECT` tree, once per planning cycle, to change one `Oid`
-per call site, is not a good trade. It is safe because it is idempotent — the
-next planning cycle finds our function instead of `nextval()` and does nothing
-— and because the fact that decided it, the target being a temporary table of
-this session, cannot change underneath a cached plan.
+per call site, is not a good trade. It is also unnecessary — scribbling on the
+`Query` is what a planner is expected to do, and the one caller that plans the
+same tree twice protects itself, in `BuildCachedPlan()`:
+
+> If we don't already have a copy of the querytree list that can be scribbled
+> on by the planner, make one. For a one-shot plan, we assume it's okay to
+> scribble on the original `query_list`.
+
+So a prepared statement hands us a fresh copy every planning cycle, and a
+simple query hands us a tree built for that execution alone. Nothing written
+here outlives the plan it was written for.
 
 At run time `seqguard_nextval()` delegates to `nextval_internal()` whenever it
 is not in parallel mode — same cache, same values, same `currval()`. Only with
@@ -344,6 +351,9 @@ Planner:
 * a plain `SELECT` calling `nextval()` — rejected by the gate, which is the
   documented narrowing;
 * `INSERT ... ON CONFLICT`, both forms — rejected by the gate;
+* the same prepared statement planned three times under `force_custom_plan`,
+  which reports three times and so shows the in-place rewrite never reaching
+  the cached tree;
 * `log` mode reporting and changing nothing.
 
 Run time, reached by calling the function directly in a `SELECT` that does go
