@@ -9,6 +9,18 @@ has no switch at all, and both `nlguard.mode` and `seqguard.mode` default to
 `on`. Loading this library changes plans — that is what it is for — so do not
 put it in `shared_preload_libraries` of a server you have not measured it on.
 
+How much it changes, measured: with the library preloaded, PostgreSQL's own
+regression suite fails **24 of 231** tests. `enforce_workers` alone accounts for
+8 of them, `nlguard` for the other 16, and `seqguard` for none — it fired on 20
+statements and changed no output, which is what the `CMD_SELECT` restriction in
+`standard_planner()` predicts. Every one of the 24 is a change of plan shape or
+of row order in a query without `ORDER BY`; in `numeric`, `point` and `geometry`
+the rows are the same multiset in a different order, and nowhere does a value, a
+row count, or an error message differ. To repeat it, note that `pg_regress`
+builds its database from `template0`, so the extension has to come in through
+`EXTRA_REGRESS_OPTS='--load-extension=enforce_workers'` rather than by being
+installed in `template1`.
+
 `seqguard` additionally needs `CREATE EXTENSION enforce_workers` in each
 database where it should work, because it substitutes a function and that
 function has to exist in `pg_proc`. Without it the feature is inert; the other
