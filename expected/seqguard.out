@@ -7,6 +7,14 @@ SET max_parallel_workers_per_gather = 2;
 SET min_parallel_table_scan_size = 0;
 SET parallel_setup_cost = 0;
 SET parallel_tuple_cost = 0;
+-- Not for the plans, for the one test below that needs a worker to actually
+-- start.  A server configured with max_parallel_workers = 0 plans the Gather
+-- and launches nobody, and ExecGather then runs the subplan in the leader
+-- whatever parallel_leader_participation says - which turns that test into a
+-- row count.  This is a USERSET GUC, so installcheck against such a server is
+-- covered; max_worker_processes is not, being PGC_POSTMASTER, and a server
+-- with no worker slots left will still produce a spurious difference there.
+SET max_parallel_workers = 8;
 CREATE TABLE sg_src (a int, b int);
 INSERT INTO sg_src SELECT i, i % 100 FROM generate_series(1, 20000) i;
 VACUUM ANALYZE sg_src;
