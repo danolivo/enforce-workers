@@ -275,6 +275,12 @@ for the same reason. What is **not** cached is unissued values: that would open
 gaps, widen the `currval()` divergence below, and buy nothing where the
 sequence behind a `serial` column has `CACHE 1` anyway.
 
+The cached parameters are invalidated by a counter rather than by walking the
+table. The `pg_sequence` callback fires on every sequence invalidation in the
+database, and `CREATE TEMP TABLE` with a `serial` column is one of those — so on
+this workload it fires as often as the table grows, which would be quadratic in
+the operation the workload does most.
+
 ### GUCs
 
 | GUC | Default | Meaning |

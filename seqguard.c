@@ -593,7 +593,7 @@ typedef struct SeqguardSeqEntry
 	Oid			relid;			/* hash key - must be first */
 	LocalTransactionId lxid;	/* lock already held in this transaction? */
 	RelFileNumber filenumber;	/* to notice a sequence rewritten under us */
-	bool		params_valid;
+	uint64		params_generation;	/* generation the parameters were read in */
 	int64		incby;
 	int64		maxv;
 	int64		minv;
@@ -603,27 +603,40 @@ typedef struct SeqguardSeqEntry
 static HTAB *seqguard_seqhash = NULL;
 
 /*
+ * Bumped by the pg_sequence invalidation callback; an entry whose
+ * params_generation differs must read pg_sequence again.  Starts at 1 so that a
+ * freshly created entry, which zeroes the field, is stale by construction.
+ */
+static uint64 seqguard_params_generation = 1;
+
+/*
  * seqguard_seq_invalidate
- *		Drop the cached pg_sequence parameters.
+ *		Note that the cached pg_sequence parameters may be out of date.
  *
  * ALTER SEQUENCE forces a rewrite for every option that affects the values it
  * will generate, so the relfilenumber test in seqguard_nextval_local() would
  * catch those on its own.  This callback is the belt to that pair of braces:
- * it costs nothing at run time and means the cache does not depend on that
- * property of init_params() staying true.
+ * it means the cache does not depend on that property of init_params() staying
+ * true.
+ *
+ * It is a counter rather than a walk over the table, and that is not
+ * fastidiousness.  The callback fires on every pg_sequence invalidation in the
+ * database, and CREATE TEMP TABLE with a serial column is one - so on a
+ * workload that creates temporary tables by the thousand it fires by the
+ * thousand, while the table it would walk is growing at the same rate.  That is
+ * quadratic in the one operation the workload does most.
+ *
+ * The counter also removes a race the flag had.  seqguard_load_params() reads
+ * the syscache, and a miss there goes to the catalog, which accepts
+ * invalidation messages - so this callback can run in the middle of the very
+ * fill it is meant to invalidate, and a flag set afterwards would record a
+ * freshness the entry does not have.  Capturing the generation before the read
+ * and storing it after makes that ordering explicit rather than lucky.
  */
 static void
 seqguard_seq_invalidate(Datum arg, int cacheid, uint32 hashvalue)
 {
-	HASH_SEQ_STATUS status;
-	SeqguardSeqEntry *entry;
-
-	if (seqguard_seqhash == NULL)
-		return;
-
-	hash_seq_init(&status, seqguard_seqhash);
-	while ((entry = (SeqguardSeqEntry *) hash_seq_search(&status)) != NULL)
-		entry->params_valid = false;
+	seqguard_params_generation++;
 }
 
 /*
@@ -658,6 +671,14 @@ seqguard_seq_lock(Oid relid)
 		ctl.keysize = sizeof(Oid);
 		ctl.entrysize = sizeof(SeqguardSeqEntry);
 
+		/*
+		 * Created on first use, which is in the middle of executing a query,
+		 * and it has to outlive that query.  It does: without HASH_CONTEXT,
+		 * hash_create() builds the table its own "dynahash" context under
+		 * TopMemoryContext and every later allocation for it goes there too,
+		 * whatever CurrentMemoryContext happens to be at the time.  The core's
+		 * create_seq_hashtable() relies on exactly the same thing.
+		 */
 		seqguard_seqhash = hash_create("seqguard sequences", 16, &ctl,
 									   HASH_ELEM | HASH_BLOBS);
 	}
@@ -669,7 +690,7 @@ seqguard_seq_lock(Oid relid)
 	{
 		entry->lxid = InvalidLocalTransactionId;
 		entry->filenumber = InvalidRelFileNumber;
-		entry->params_valid = false;
+		entry->params_generation = 0;
 	}
 
 	if (entry->lxid != thislxid)
@@ -692,12 +713,19 @@ seqguard_seq_lock(Oid relid)
 /*
  * seqguard_load_params
  *		Refresh the cached pg_sequence parameters for this entry.
+ *
+ * The generation is read before the syscache lookup and stored after it, not
+ * the other way round: the lookup can go to the catalog, accepting
+ * invalidation messages on the way, and one of those may be for this very
+ * sequence.  Recording the generation we started from means such a message is
+ * not lost - the entry simply reads pg_sequence again next time.
  */
 static void
 seqguard_load_params(SeqguardSeqEntry *entry)
 {
 	HeapTuple	pgstuple;
 	Form_pg_sequence pgsform;
+	uint64		generation = seqguard_params_generation;
 
 	pgstuple = SearchSysCache1(SEQRELID, ObjectIdGetDatum(entry->relid));
 	if (!HeapTupleIsValid(pgstuple))
@@ -712,7 +740,7 @@ seqguard_load_params(SeqguardSeqEntry *entry)
 
 	ReleaseSysCache(pgstuple);
 
-	entry->params_valid = true;
+	entry->params_generation = generation;
 }
 
 /*
@@ -753,10 +781,10 @@ seqguard_nextval_local(Relation seqrel, SeqguardSeqEntry *entry)
 	if (seqrel->rd_rel->relfilenode != entry->filenumber)
 	{
 		entry->filenumber = seqrel->rd_rel->relfilenode;
-		entry->params_valid = false;
+		entry->params_generation = 0;
 	}
 
-	if (!entry->params_valid)
+	if (entry->params_generation != seqguard_params_generation)
 		seqguard_load_params(entry);
 
 	incby = entry->incby;
