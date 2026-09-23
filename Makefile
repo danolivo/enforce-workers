@@ -1,4 +1,4 @@
-# contrib/enforce-workers/Makefile
+# contrib/enforce_workers/Makefile
 
 MODULE_big = enforce_workers
 OBJS = \
@@ -19,7 +19,7 @@ PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 else
-subdir = contrib/enforce-workers
+subdir = contrib/enforce_workers
 top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk

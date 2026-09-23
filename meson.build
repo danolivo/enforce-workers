@@ -1,4 +1,4 @@
-# contrib/enforce-workers/meson.build
+# contrib/enforce_workers/meson.build
 
 enforce_workers_sources = files(
   'enforce_workers.c',
