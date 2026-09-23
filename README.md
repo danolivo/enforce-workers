@@ -299,7 +299,10 @@ the operation the workload does most.
 
 * Requires `CREATE EXTENSION enforce_workers` in the database. Without it the
   module says so once per statement with a candidate call (at
-  `seqguard.log_level`) and plans normally.
+  `seqguard.log_level`) and plans normally. Creating or dropping the extension
+  takes effect in sessions that are already open, and the replacement is found
+  in the schema the extension was created in rather than through `search_path`
+  — including after `ALTER EXTENSION ... SET SCHEMA`.
 * **Only `INSERT` into a temporary table is considered**, and not one with `ON
   CONFLICT`. A `SELECT`, an `UPDATE`, or an `INSERT` into a permanent table
   never reaches the walk — see the gate above.
@@ -369,7 +372,10 @@ parallel:
 * a `serial` column on a temporary table behaving as before;
 * the documented `currval()` limitation, and the sequence having advanced
   anyway;
-* the feature going inert, not broken, after `DROP EXTENSION`.
+* the feature going inert after `DROP EXTENSION` and coming back after
+  `CREATE EXTENSION`, in the same session both times;
+* the replacement found in a schema that is not in `search_path`, and after
+  `ALTER EXTENSION ... SET SCHEMA`.
 
 ## Build
 
@@ -396,6 +402,23 @@ or put `enforce_workers` in `session_preload_libraries` or
 a function that has to exist:
 
     CREATE EXTENSION enforce_workers;
+
+Two things to know before deploying this under an application rather than under
+psql.
+
+`LOAD` is superuser-only — a plain user gets *access to library
+"enforce_workers" is not allowed* — and so is `CREATE EXTENSION`, since the
+control file is not `trusted`. An application connecting as an ordinary role
+therefore cannot load this itself: put the library in
+`shared_preload_libraries` or `session_preload_libraries` and have a superuser
+run `CREATE EXTENSION` once per database. `CREATE EXTENSION` takes effect in
+sessions that are already open, so the order does not matter.
+
+And if the library is *not* loaded, `SET seqguard.mode = off` still succeeds.
+An unrecognised `prefix.name` setting becomes a placeholder, so the statement
+reports success and changes nothing. `SHOW seqguard.mode` returning a value is
+not evidence that the module is running; a substitution reported at
+`seqguard.log_level`, or `seqguard_nextval` appearing in `EXPLAIN VERBOSE`, is.
 
 To load the library for one override only:
 

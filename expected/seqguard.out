@@ -385,9 +385,60 @@ NOTICE:  seqguard: would substitute nextval("sg_tmp_dst_id_seq")
    ->  Seq Scan on sg_src
 (2 rows)
 
+--
+-- ... and it comes back when the extension is created again, without
+-- reconnecting.  The pg_proc invalidation drops the negative answer just as it
+-- dropped the positive one, and this is the order a deployment actually takes:
+-- the library is preloaded, the sessions are already open, and somebody runs
+-- CREATE EXTENSION afterwards.  Were the failed lookup remembered, every
+-- existing connection would stay inert with nothing in the log to say so.
+--
+CREATE EXTENSION enforce_workers;
+EXPLAIN (COSTS OFF)
+INSERT INTO sg_tmp_dst (a) SELECT a FROM sg_src;
+NOTICE:  seqguard: substituting nextval("sg_tmp_dst_id_seq")
+        QUERY PLAN        
+--------------------------
+ Insert on sg_tmp_dst
+   ->  Seq Scan on sg_src
+(2 rows)
+
+--
+-- The replacement is looked up in the schema the extension was created in,
+-- not through search_path.  That is not fastidiousness: the statements this
+-- rewrites belong to an application that sets its own search_path and has
+-- never heard of this module.
+--
+DROP EXTENSION enforce_workers;
+CREATE SCHEMA sg_ns;
+CREATE EXTENSION enforce_workers SCHEMA sg_ns;
+SET search_path = pg_catalog;
+EXPLAIN (COSTS OFF)
+INSERT INTO pg_temp.sg_tmp_dst (a) SELECT a FROM public.sg_src;
+NOTICE:  seqguard: substituting nextval("sg_tmp_dst_id_seq")
+        QUERY PLAN        
+--------------------------
+ Insert on sg_tmp_dst
+   ->  Seq Scan on sg_src
+(2 rows)
+
+RESET search_path;
+-- Moving the extension afterwards does not strand the cached OID either.
+ALTER EXTENSION enforce_workers SET SCHEMA public;
+EXPLAIN (COSTS OFF)
+INSERT INTO sg_tmp_dst (a) SELECT a FROM sg_src;
+NOTICE:  seqguard: substituting nextval("sg_tmp_dst_id_seq")
+        QUERY PLAN        
+--------------------------
+ Insert on sg_tmp_dst
+   ->  Seq Scan on sg_src
+(2 rows)
+
 \set VERBOSITY default
 RESET seqguard.log_level;
+DROP SCHEMA sg_ns;
 DROP TABLE sg_tmp_dst;
 DROP TABLE sg_perm_dst;
 DROP TABLE sg_src;
 DROP SEQUENCE sg_perm_seq;
+DROP EXTENSION enforce_workers;
