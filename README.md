@@ -527,6 +527,12 @@ are 98% of the index maintenance time, and those below a hundred thousand are
 
 ### Caveats
 
+The full list — what changes, what it costs, the correct load order and the
+check in the code that enforces it, interaction with `auto_explain`,
+`pg_stat_statements`, `online_analyze` and other libraries, and what has not
+been tested — is in **[idxdefer-caveats.md](idxdefer-caveats.md)**. The ones
+most likely to matter:
+
 * Put `enforce_workers` first in `shared_preload_libraries`; otherwise inserts
   whose plans run in parallel mode are not deferred.
 * A rebuild is a full index build, using up to `idxdefer.maintenance_work_mem`
@@ -535,9 +541,6 @@ are 98% of the index maintenance time, and those below a hundred thousand are
   table may be planned differently.
 * An error in an index expression is raised after all rows are in, from the
   rebuild, rather than on the offending row.
-* The protection for readers works through the planner, so a C function that
-  opens the target's index directly while the `INSERT` runs sees it
-  incomplete until the rebuild.
 * The mechanism depends on how PostgreSQL 18's `ExecInsert()` opens indexes.
   The regression suite passes against Tantor SE 1C 18.4, and the parallel-mode
   path was checked there by hand; run both again on any other build.

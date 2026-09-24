@@ -134,7 +134,8 @@
  * those below a hundred thousand are 0.2%.  A misestimate costs one needless
  * rebuild, never a wrong answer.  The rebuild also moves the index to a new
  * relfilenode and updates pg_class, and the cached plans that the
- * invalidation above threw away are planned again.
+ * invalidation above threw away are planned again.  Everything else is listed
+ * in idxdefer-caveats.md.
  *
  *-------------------------------------------------------------------------
  */
