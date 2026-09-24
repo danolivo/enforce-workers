@@ -19,4 +19,7 @@ extern void nlguard_init(void);
 /* seqguard.c */
 extern void seqguard_init(void);
 
+/* idxdefer.c */
+extern void idxdefer_init(void);
+
 #endif							/* ENFORCE_WORKERS_H */

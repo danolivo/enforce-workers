@@ -1,13 +1,15 @@
 # enforce_workers
 
-Three unrelated planner overrides in one loadable module: `enforce_workers`
-below, then `nlguard`, then `seqguard`. Each lives in its own file and can be
-switched off independently; `_PG_init()` is the only entry point.
+Three unrelated planner overrides and one executor override in one loadable
+module: `enforce_workers` below, then `nlguard`, `seqguard` and `idxdefer`.
+Each lives in its own file and can be switched off independently; `_PG_init()`
+is the only entry point.
 
-**All three are active the moment the library is loaded.** `enforce_workers`
-has no switch at all, and both `nlguard.mode` and `seqguard.mode` default to
-`on`. Loading this library changes plans — that is what it is for — so do not
-put it in `shared_preload_libraries` of a server you have not measured it on.
+**All four are active the moment the library is loaded.** `enforce_workers`
+has no switch at all, and `nlguard.mode`, `seqguard.mode` and `idxdefer.mode`
+all default to `on`. Loading this library changes plans — that is what it is
+for — so do not put it in `shared_preload_libraries` of a server you have not
+measured it on.
 
 How much it changes, measured: with the library preloaded, PostgreSQL's own
 regression suite fails **24 of 231** tests. `enforce_workers` alone accounts for
@@ -19,7 +21,8 @@ the rows are the same multiset in a different order, and nowhere does a value, a
 row count, or an error message differ. To repeat it, note that `pg_regress`
 builds its database from `template0`, so the extension has to come in through
 `EXTRA_REGRESS_OPTS='--load-extension=enforce_workers'` rather than by being
-installed in `template1`.
+installed in `template1`. `idxdefer` came later and has not been through that
+measurement.
 
 `seqguard` additionally needs `CREATE EXTENSION enforce_workers` in each
 database where it should work, because it substitutes a function and that
@@ -389,6 +392,155 @@ parallel:
 * the replacement found in a schema that is not in `search_path`, and after
   `ALTER EXTENSION ... SET SCHEMA`.
 
+## idxdefer
+
+Builds the indexes of a temporary table once, after a bulk
+`INSERT ... SELECT`, instead of maintaining them row by row.
+
+1C creates an index on every temporary table straight after `CREATE TEMPORARY
+TABLE`, then fills the table with one large `INSERT ... SELECT` whose rows come
+in effectively random order for the index key. Once the index outgrows
+`temp_buffers`, nearly every insertion lands on an evicted leaf: the dirty
+victim is written out, the leaf read back. On the 1C stand one such statement
+inserts 13 million rows into a table that ends up about 1.5 GB with its index,
+and writes 29 GB of local buffers doing it; a synthetic reproduction takes
+84.7 s as 1C does it and 5.3 + 14.3 s with the index built afterwards. Across a
+package run, the `Insert` nodes of indexed temporary-table inserts are about
+half of the time the database spends.
+
+### How it acts
+
+`ExecutorStart_hook` runs after the standard processing, when the result
+relation is set up but its indexes are not yet open — PG18's `ExecInsert()`
+opens them lazily on the first row, and only if `ri_IndexRelationDescs` is
+still `NULL`. For an `INSERT` that qualifies, the hook puts an empty array
+there with `ri_NumIndices = 0`, so the rows go into the heap only, and wraps
+the `ModifyTable` node's `ExecProcNode` with `ExecSetExecProcNode()`. The
+moment the node reports that it is done, still inside it, the wrapper rebuilds
+the real indexes with `reindex_index()` — a sort-based build, as `CREATE INDEX`
+on a filled table would do. No hook of any library can run between the last
+row and the rebuild, whatever the load order, and the rebuild counts as part of
+the `Insert` node for `EXPLAIN ANALYZE`, `auto_explain` and
+`pg_stat_statements`, just as row-by-row maintenance did.
+
+A plan that runs in parallel mode cannot update catalogs until `ExecutePlan()`
+leaves that mode, which is after the node is done, so such a plan is not
+deferred. `ExecutorFinish` and `ExecutorEnd` rebuild anything still pending,
+as a safety net that is not expected to fire; if it ever does, it says so
+with a `WARNING`.
+
+No catalog row is touched to switch maintenance off. Clearing
+`pg_index.indisready` would be a transactional catalog update and a relcache
+invalidation twice per statement, only visible to the backend itself after a
+command counter increment. (`indisvalid` would not have helped: it keeps the
+planner from reading an index, while `ExecInsertIndexTuples()` tests
+`ii_ReadyForInserts`, which comes from `indisready`.)
+
+An `INSERT` qualifies when all of these hold:
+
+* it is a plain `INSERT` with one target, no `RETURNING`, no `ON CONFLICT` and
+  no data-modifying CTE, and not under `EXPLAIN` without `ANALYZE`;
+* the target is an ordinary temporary table of this backend, not a parallel
+  worker's view of the leader's;
+* the table has no triggers, and every index is valid, ready, live, neither
+  unique nor exclusion, and not currently open — by a cursor, or by a scan in
+  the statement itself;
+* the table has no pages when the statement starts;
+* the planner expects at least `idxdefer.min_rows` rows.
+
+### Why it is safe
+
+While the statement runs, the heap has rows the index does not know about.
+Nothing that needs the index to decide what happens to a row is allowed, so
+that state can only be observed by reading the table, and it can only outlive
+the statement on an error.
+
+* **The statement itself.** Its own rows are invisible to its own snapshot and
+  the table started empty, so any scan in it sees nothing, index or not.
+* **Code it calls.** A `VOLATILE` function in the source query runs with a newer
+  command id and does see the rows inserted so far — possibly through the
+  index. So while an `INSERT` is deferred, `get_relation_info_hook` removes its
+  target's indexes from any query planned in the meantime, and the target's
+  relcache entry is invalidated and the invalidation processed at once, which
+  makes every cached plan that depends on the table be replanned on its next
+  use. The function reads the table with a sequential scan and sees exactly
+  what it would have seen without the module. A `STABLE` or `IMMUTABLE` function
+  uses the statement's own snapshot and cannot see those rows at all.
+* **Other libraries.** None of their code runs between the last row and the
+  rebuild, whatever the load order.
+* **Errors.** A failed `INSERT` rebuilds nothing; its rows are dead,
+  and an index without entries for dead tuples is a valid index. A failed
+  rebuild aborts the transaction, which discards the new relfilenode and keeps
+  the old index — consistent with the heap, because the rows it lacks are the
+  ones the abort killed. There is never anything to repair. Transaction and
+  subtransaction callbacks forget registered deferrals, and a deferral still
+  pending at commit is refused rather than let the table outlive it.
+
+### GUCs
+
+| GUC | Default | Meaning |
+| --- | --- | --- |
+| `idxdefer.mode` | `on` | `off` leaves inserts alone; `log` reports the inserts that would be deferred; `on` defers them. |
+| `idxdefer.log_level` | `debug1` | Level at which deferrals and rebuilds are reported; the estimate is in the `DETAIL`. |
+| `idxdefer.min_rows` | `1000000` | Planner estimate below which an insert keeps its index maintenance. |
+
+The default for `min_rows` comes from the stand: in a baseline run of the
+`cherkizovo` package, indexed temporary-table inserts of a million rows or more
+are 98% of the index maintenance time, and those below a hundred thousand are
+0.2%.
+
+### Caveats
+
+* Inserts whose plans run in parallel mode are not deferred.
+* A rebuild is a full index build, using up to `maintenance_work_mem` and, if
+  that is not enough, temporary files.
+* The rebuild fills in `reltuples` and `relpages`, so later queries on the same
+  table may be planned differently.
+* An error in an index expression is raised after all rows are in, from the
+  rebuild, rather than on the offending row.
+* The protection for readers works through the planner, so a C function that
+  opens the target's index directly while the `INSERT` runs sees it
+  incomplete until the rebuild.
+* The mechanism depends on how PostgreSQL 18's `ExecInsert()` opens indexes;
+  run the regression suite against any other build before enabling it.
+
+### Tests
+
+`sql/idxdefer.sql` checks every rebuilt index with `amcheck`'s
+`bt_index_check(..., heapallindexed => true)` where `amcheck` is available
+(`make check` installs it), and reads each through an index scan against the
+heap in any case. Covered:
+
+* the deferral itself, on a plain, an expression and a partial index, with the
+  relfilenode changing; after `TRUNCATE` again; an insert of no rows, which
+  defers and rebuilds nothing; `EXPLAIN` without `ANALYZE`, which defers nothing,
+  and with it, which does; a prepared insert with a cached generic plan,
+  deferred on each execution into an empty table and left alone otherwise;
+* what is left alone: an insert below `min_rows`, into a non-empty table, into a
+  permanent table, with a unique index or a primary key (and the duplicate
+  still caught on its row), with `ON CONFLICT DO NOTHING`, with `RETURNING`,
+  inside a data-modifying CTE, on a table with a trigger, and with an index held
+  open by a cursor; a plain CTE in the source is deferred;
+* `log` and `off`;
+* errors: a failing insert, a failing rebuild (an index expression dividing by
+  zero), a rollback to a savepoint after the rebuild, and a failure inside a
+  PL/pgSQL exception block followed by a normal commit;
+* a `VOLATILE` function reading the target during the insert, called for the
+  first time half way through, with its generic plan cached through the index
+  beforehand — it sees every row inserted so far — under read committed,
+  repeatable read and serializable;
+* a `VOLATILE` function updating (HOT and not) and deleting rows of the target
+  while the insert runs;
+* a deferred insert nested in a function called by another query, and one
+  nested inside a deferred insert into the same table;
+* a GIN index.
+
+Each of the three protections was checked by disabling it: without the rebuild,
+`amcheck` reports heap tuples missing from the index and index scans return
+nothing; without hiding the indexes from the planner, the `VOLATILE` function
+sees none of the 2 500 rows it should; without processing the invalidation
+at once, its first call still goes through the stale cached plan and misses one.
+
 ## Build
 
 In-tree:
@@ -408,7 +560,7 @@ Load the library:
     LOAD 'enforce_workers';
 
 or put `enforce_workers` in `session_preload_libraries` or
-`shared_preload_libraries`. All three overrides take effect immediately.
+`shared_preload_libraries`. All four overrides take effect immediately.
 
 `seqguard` needs one more step, per database, because it points query trees at
 a function that has to exist:
@@ -437,6 +589,7 @@ To load the library for one override only:
     LOAD 'enforce_workers';
     SET nlguard.mode = off;          -- and leave seqguard.mode alone, or
     SET seqguard.mode = off;         -- parallelism override only
+    SET idxdefer.mode = off;         -- no index maintenance deferral
 
 `enforce_workers` has no equivalent switch; unload the library to be rid of
 it.
