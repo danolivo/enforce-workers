@@ -20,9 +20,9 @@
  * or by listing it in session_preload_libraries / shared_preload_libraries.
  *
  * The module has grown two further, unrelated planner tweaks, in nlguard.c and
- * seqguard.c.  Each feature keeps to its own file and exposes one initialiser;
- * _PG_init() at the bottom of this file is the only entry point and the only
- * place that decides what gets installed.
+ * seqguard.c, and one executor tweak, in idxdefer.c.  Each feature keeps to its
+ * own file and exposes one initialiser; _PG_init() at the bottom of this file
+ * is the only entry point and the only place that decides what gets installed.
  *
  * seqguard is the one feature with an SQL half: its replacement function has
  * to exist in pg_proc for the planner to point a call at it.  Loading the
@@ -94,4 +94,5 @@ _PG_init(void)
 	enforce_workers_init();
 	nlguard_init();
 	seqguard_init();
+	idxdefer_init();
 }

@@ -4,6 +4,7 @@ enforce_workers_sources = files(
   'enforce_workers.c',
   'nlguard.c',
   'seqguard.c',
+  'idxdefer.c',
 )
 
 if host_system == 'windows'
@@ -32,6 +33,7 @@ tests += {
     'sql': [
       'nlguard',
       'seqguard',
+      'idxdefer',
     ],
   },
 }
