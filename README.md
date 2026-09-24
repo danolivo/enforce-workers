@@ -424,10 +424,16 @@ the `Insert` node for `EXPLAIN ANALYZE`, `auto_explain` and
 `pg_stat_statements`, just as row-by-row maintenance did.
 
 A plan that runs in parallel mode cannot update catalogs until `ExecutePlan()`
-leaves that mode, which is after the node is done, so such a plan is not
-deferred. `ExecutorFinish` and `ExecutorEnd` rebuild anything still pending,
-as a safety net that is not expected to fire; if it ever does, it says so
-with a `WARNING`.
+leaves that mode. Tantor SE, with `enable_parallel_insert`, plans
+`INSERT ... SELECT` into a temporary table as `Insert` over `Gather`, so on the
+stand this is the common case, not a corner. For such a plan the rebuild
+happens in the `ExecutorRun` hook, right after `standard_ExecutorRun()` returns.
+That is only safe if the hook is the innermost one, so such plans are deferred
+only when `enforce_workers` was loaded before any other library with an
+`ExecutorRun` hook; otherwise the statement is left alone, the reason is
+reported, and a `LOG` line at startup says so once. `ExecutorFinish` and
+`ExecutorEnd` rebuild anything still pending, as a safety net that is not
+expected to fire; if it ever does, it says so with a `WARNING`.
 
 No catalog row is touched to switch maintenance off. Clearing
 `pg_index.indisready` would be a transactional catalog update and a relcache
@@ -466,8 +472,8 @@ the statement on an error.
   use. The function reads the table with a sequential scan and sees exactly
   what it would have seen without the module. A `STABLE` or `IMMUTABLE` function
   uses the statement's own snapshot and cannot see those rows at all.
-* **Other libraries.** None of their code runs between the last row and the
-  rebuild, whatever the load order.
+* **Other libraries.** On a serial plan none of their code runs between the
+  last row and the rebuild; on a parallel-mode plan, see above.
 * **Errors.** A failed `INSERT` rebuilds nothing; its rows are dead,
   and an index without entries for dead tuples is a valid index. A failed
   rebuild aborts the transaction, which discards the new relfilenode and keeps
@@ -491,7 +497,8 @@ are 98% of the index maintenance time, and those below a hundred thousand are
 
 ### Caveats
 
-* Inserts whose plans run in parallel mode are not deferred.
+* Put `enforce_workers` first in `shared_preload_libraries`; otherwise inserts
+  whose plans run in parallel mode are not deferred.
 * A rebuild is a full index build, using up to `maintenance_work_mem` and, if
   that is not enough, temporary files.
 * The rebuild fills in `reltuples` and `relpages`, so later queries on the same
@@ -501,8 +508,9 @@ are 98% of the index maintenance time, and those below a hundred thousand are
 * The protection for readers works through the planner, so a C function that
   opens the target's index directly while the `INSERT` runs sees it
   incomplete until the rebuild.
-* The mechanism depends on how PostgreSQL 18's `ExecInsert()` opens indexes;
-  run the regression suite against any other build before enabling it.
+* The mechanism depends on how PostgreSQL 18's `ExecInsert()` opens indexes.
+  The regression suite passes against Tantor SE 1C 18.4, and the parallel-mode
+  path was checked there by hand; run both again on any other build.
 
 ### Tests
 
