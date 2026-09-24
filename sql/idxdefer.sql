@@ -388,7 +388,7 @@ RESET plan_cache_mode;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 
--- A GIN index goes through the same rebuild.
+-- A GIN index: no estimate for its build, so it gets the limit as it is.
 CREATE TEMP TABLE gin_t (a int[]);
 CREATE INDEX gin_t_a ON gin_t USING gin (a);
 INSERT INTO gin_t SELECT ARRAY[i, i + 1] FROM generate_series(1, 5000) i;
@@ -397,9 +397,50 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM gin_t WHERE a @> ARRAY[4242];
 SELECT count(*) FROM gin_t WHERE a @> ARRAY[4242];
 RESET enable_seqscan;
 
+--
+-- The memory for the rebuild: the sort size estimated from the rows that went
+-- in, or idxdefer.maintenance_work_mem if that is smaller.  An index
+-- expression shows what maintenance_work_mem is while it runs, which is during
+-- the rebuild.  For an expression the estimate uses the heap's footprint per
+-- row as the tuple width: here 23 pages for 5000 rows of two integers, so
+-- 5000 * (24 + 23 * 8192 / 5000) bytes, a quarter on top and a megabyte of
+-- slack, or 1400 kB.
+--
+SHOW idxdefer.maintenance_work_mem;
+-- The probe only speaks while test.probe is set, so that amcheck, which
+-- evaluates the expression too, stays quiet.
+CREATE FUNCTION mem_probe(k int) RETURNS int LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+	IF k = 1 AND current_setting('test.probe', true) = 'on' THEN
+		RAISE NOTICE 'maintenance_work_mem is %',
+			current_setting('maintenance_work_mem');
+	END IF;
+	RETURN k;
+END
+$$;
+CREATE TEMP TABLE mem (a int, b int);
+CREATE INDEX mem_probe ON mem (mem_probe(a));
+SET test.probe = on;
+INSERT INTO mem SELECT i, i FROM generate_series(1, 5000) i;
+RESET test.probe;
+SELECT pg_relation_size('mem') / current_setting('block_size')::int AS pages;
+-- The limit wins when it is smaller.
+TRUNCATE mem;
+SET idxdefer.maintenance_work_mem = '1MB';
+SET test.probe = on;
+INSERT INTO mem SELECT i, i FROM generate_series(1, 5000) i;
+RESET test.probe;
+SELECT idx_ok('mem_probe'), count(*) FROM mem;
+-- The limit has maintenance_work_mem's own floor.
+SET idxdefer.maintenance_work_mem = 1;
+RESET idxdefer.maintenance_work_mem;
+SHOW idxdefer.maintenance_work_mem;
+
 DROP FUNCTION fill_nest();
 DROP FUNCTION fill_nest2(int);
 DROP FUNCTION upd_touch(int);
+DROP TABLE mem;
+DROP FUNCTION mem_probe(int);
 DROP FUNCTION vol_seen(int);
 DROP FUNCTION trg_noop() CASCADE;
 DROP FUNCTION idx_node(regclass);
