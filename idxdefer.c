@@ -60,7 +60,15 @@
  *
  *   - For a plan that runs in parallel mode that is impossible: a catalog
  *     update is refused in parallel mode, and ExecutePlan() only leaves it
- *     after the node is done.  Such a plan is not deferred at all.
+ *     after the node is done.  On Tantor SE this is the common case, not a
+ *     corner: with enable_parallel_insert its planner puts a Gather under the
+ *     Insert node, which the stock planner never does.  The earliest point
+ *     after that is the ExecutorRun hook, right after standard_ExecutorRun()
+ *     returns - and only if our hook is the innermost one, so that no other
+ *     library's post-processing runs first.  Whether it is, is fixed when the
+ *     library is loaded, so it is recorded then, and a parallel plan is simply
+ *     not deferred when it is not.  The rebuild is charged to totaltime by
+ *     hand on this path.
  *
  *   - ExecutorFinish and ExecutorEnd rebuild whatever is somehow still
  *     pending, before any processing of their own.  Neither is expected to
@@ -94,8 +102,9 @@
  *     IMMUTABLE function runs with the statement's own snapshot and cannot see
  *     those rows at all.
  *
- * 3.  Other libraries' hooks.  None runs between the last row and the
- *     rebuild.
+ * 3.  Other libraries' hooks.  None runs between the last row and the rebuild
+ *     on the normal path, and on the parallel path the only code that does is
+ *     the tail of standard_ExecutorRun() itself; see above.
  *
  * 4.  An error.  If the INSERT fails, nothing is rebuilt; the rows it did
  *     insert are dead, and an index that lacks entries for dead tuples is a
@@ -185,9 +194,19 @@ static int	idxdefer_log_level = DEBUG1;
 static int	idxdefer_min_rows = 1000000;
 
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
+static ExecutorRun_hook_type prev_ExecutorRun = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 static get_relation_info_hook_type prev_get_relation_info_hook = NULL;
+
+/*
+ * Was there no ExecutorRun_hook before ours when the library was loaded?
+ * Then ours calls standard_ExecutorRun() directly, and the code right after
+ * that call is the first thing to run once the plan is done - which is what
+ * the parallel path depends on.  Libraries loaded later wrap around us and
+ * cannot change that, so this is decided once, in idxdefer_init().
+ */
+static bool idxdefer_run_hook_innermost = false;
 
 /*
  * Where a deferral is in its life.  The indexes stay hidden from the planner
@@ -219,12 +238,14 @@ typedef struct IdxdeferTarget
 typedef enum IdxdeferPoint
 {
 	IDXDEFER_AT_NODE,			/* inside the ModifyTable node */
+	IDXDEFER_AT_RUN,			/* in the ExecutorRun hook */
 	IDXDEFER_AT_FINISH,			/* in the ExecutorFinish hook */
 	IDXDEFER_AT_END				/* in the ExecutorEnd hook */
 } IdxdeferPoint;
 
 static const char *const idxdefer_point_names[] = {
 	[IDXDEFER_AT_NODE] = "at the end of the insert",
+	[IDXDEFER_AT_RUN] = "after the parallel plan finished",
 	[IDXDEFER_AT_FINISH] = "in ExecutorFinish",
 	[IDXDEFER_AT_END] = "in ExecutorEnd",
 };
@@ -471,7 +492,7 @@ idxdefer_rebuild_callback(void *arg)
  * 'account' is the instrumentation to charge the work to when the caller is
  * outside the executor's own accounting (the hooks), or NULL when the work
  * happens inside a plan node and is counted already.  'point' says where the
- * caller is; anywhere but the node itself is reported.
+ * caller is; anywhere but the two expected places is reported.
  */
 static void
 idxdefer_rebuild(IdxdeferTarget *target, Instrumentation *account,
@@ -511,12 +532,15 @@ idxdefer_rebuild(IdxdeferTarget *target, Instrumentation *account,
 	}
 
 	/*
-	 * The expected place is the node itself.  Anything else means the node's
+	 * The two expected places are the node itself and, for a plan that ran in
+	 * parallel mode, the ExecutorRun hook.  Anything else means the node's
 	 * end went unnoticed - another library replaced its ExecProcNode, say -
 	 * and the rebuild is late: correct, but after code that the design meant
 	 * to keep out of the window.  That should never be silent.
 	 */
-	if (point != IDXDEFER_AT_NODE)
+	if (point == IDXDEFER_AT_FINISH || point == IDXDEFER_AT_END ||
+		(point == IDXDEFER_AT_RUN &&
+		 !target->queryDesc->plannedstmt->parallelModeNeeded))
 		ereport(WARNING,
 				(errmsg("idxdefer: rebuilding the indexes of \"%s\" %s, later than expected",
 						RelationGetRelationName(rel),
@@ -602,8 +626,8 @@ idxdefer_rebuild(IdxdeferTarget *target, Instrumentation *account,
  *
  * Without RETURNING, ExecModifyTable() consumes its whole input in one call
  * and returns NULL, so this runs once per statement and the rebuild happens
- * the moment the last row is in.  A plan that runs in parallel mode is never
- * deferred, so the check for it below is only a precaution.
+ * the moment the last row is in.  In parallel mode it cannot, and the
+ * ExecutorRun hook does it instead.
  */
 static TupleTableSlot *
 idxdefer_ExecModifyTable(PlanState *pstate)
@@ -799,12 +823,20 @@ idxdefer_consider(QueryDesc *queryDesc)
 		return;
 
 	/*
-	 * A plan that runs in parallel mode cannot be rebuilt for inside the
-	 * node: a catalog update is refused in parallel mode, and ExecutePlan()
-	 * only leaves it after the node is done.  Leave such a statement alone.
+	 * A plan that runs in parallel mode can only be rebuilt for once
+	 * ExecutePlan() has left it, which is after standard_ExecutorRun() - and
+	 * the rebuild is only guaranteed to be the first thing to run after that
+	 * if our ExecutorRun hook is the innermost one.  If it is not, another
+	 * library's hook would see the table with its index incomplete, so leave
+	 * the statement alone and say why.
 	 */
-	if (pstmt->parallelModeNeeded)
+	if (pstmt->parallelModeNeeded && !idxdefer_run_hook_innermost)
 	{
+		ereport(idxdefer_log_level,
+				(errmsg("idxdefer: not deferring index maintenance on \"%s\"",
+						RelationGetRelationName(rel)),
+				 errdetail("The plan runs in parallel mode, and another library's ExecutorRun hook would run between the insert and the rebuild."),
+				 errhint("List enforce_workers before every other library in shared_preload_libraries.")));
 		list_free(indexes);
 		return;
 	}
@@ -834,6 +866,34 @@ idxdefer_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		(eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0 &&
 		!IsParallelWorker())
 		idxdefer_consider(queryDesc);
+}
+
+/*
+ * idxdefer_ExecutorRun
+ *		ExecutorRun_hook entry point.
+ *
+ * The rebuild point for a plan that ran in parallel mode; see the top of the
+ * file.  standard_ExecutorRun() has stopped queryDesc->totaltime by now, so
+ * the work is charged to it here.
+ */
+static void
+idxdefer_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
+					 uint64 count)
+{
+	IdxdeferTarget *target;
+
+	if (prev_ExecutorRun)
+		prev_ExecutorRun(queryDesc, direction, count);
+	else
+		standard_ExecutorRun(queryDesc, direction, count);
+
+	if (idxdefer_targets == NIL)
+		return;
+
+	target = idxdefer_find_target(queryDesc);
+	if (target != NULL && target->state == IDXDEFER_PENDING &&
+		target->mtstate->mt_done)
+		idxdefer_rebuild(target, queryDesc->totaltime, IDXDEFER_AT_RUN);
 }
 
 /*
@@ -1008,6 +1068,21 @@ idxdefer_init(void)
 
 	prev_ExecutorStart = ExecutorStart_hook;
 	ExecutorStart_hook = idxdefer_ExecutorStart;
+
+	/*
+	 * Must be decided before we install ourselves; see its declaration.  A
+	 * wrong load order costs every parallel-mode insert its deferral, which
+	 * on a build that runs INSERT ... SELECT in parallel is most of them, so
+	 * say so once rather than per statement at a debug level.
+	 */
+	idxdefer_run_hook_innermost = (ExecutorRun_hook == NULL);
+	if (!idxdefer_run_hook_innermost)
+		ereport(process_shared_preload_libraries_in_progress ? LOG : WARNING,
+				(errmsg("idxdefer: inserts whose plans run in parallel mode will keep maintaining their indexes"),
+				 errdetail("Another library installed an ExecutorRun hook before enforce_workers was loaded."),
+				 errhint("List enforce_workers before every other library in shared_preload_libraries.")));
+	prev_ExecutorRun = ExecutorRun_hook;
+	ExecutorRun_hook = idxdefer_ExecutorRun;
 
 	prev_ExecutorFinish = ExecutorFinish_hook;
 	ExecutorFinish_hook = idxdefer_ExecutorFinish;
