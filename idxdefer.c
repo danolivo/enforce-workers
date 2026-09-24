@@ -76,6 +76,15 @@
  *     late rebuild, never a missing one.  A rebuild that happens anywhere but
  *     where it is expected is reported as a WARNING.
  *
+ * How much memory the rebuild gets
+ * --------------------------------
+ * When the rebuild starts, the rows are in and there is no need to guess any
+ * more: the statement counted them, and the heap's size bounds how large they
+ * are.  For a B-tree, whose build is one tuplesort of index tuples, that is
+ * enough to estimate what the sort needs to stay in memory, and the rebuild
+ * gets that much maintenance_work_mem - or idxdefer.maintenance_work_mem, the
+ * module's own limit, if the estimate is larger.  See idxdefer_sort_mem().
+ *
  * Why this is safe
  * ----------------
  * The target is empty when the statement starts, belongs to this backend, and
@@ -134,10 +143,14 @@
 #include <limits.h>
 
 #include "access/genam.h"
+#include "access/htup_details.h"
+#include "access/itup.h"
 #include "access/parallel.h"
 #include "access/table.h"
+#include "access/tupmacs.h"
 #include "access/xact.h"
 #include "catalog/index.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_index.h"
 #include "executor/executor.h"
@@ -149,6 +162,7 @@
 #include "optimizer/plancat.h"
 #include "portability/instr_time.h"
 #include "storage/bufmgr.h"
+#include "storage/itemid.h"
 #include "storage/procnumber.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
@@ -157,6 +171,7 @@
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/snapmgr.h"
+#include "utils/tuplesort.h"
 
 #include "enforce_workers.h"
 
@@ -192,6 +207,7 @@ static const struct config_enum_entry idxdefer_loglevel_options[] = {
 static int	idxdefer_mode = IDXDEFER_ON;
 static int	idxdefer_log_level = DEBUG1;
 static int	idxdefer_min_rows = 1000000;
+static int	idxdefer_maintenance_work_mem = 1024 * 1024;	/* 1GB, in kB */
 
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun = NULL;
@@ -230,6 +246,7 @@ typedef struct IdxdeferTarget
 	ExecProcNodeMtd orig_exec;	/* what the node ran before we wrapped it */
 	Oid			relid;			/* its target table */
 	List	   *indexes;		/* OIDs of the indexes to rebuild */
+	double		plan_rows;		/* the planner's estimate, as a fallback */
 	SubTransactionId subid;		/* subtransaction it was registered in */
 	IdxdeferState state;
 } IdxdeferTarget;
@@ -466,6 +483,117 @@ idxdefer_rebuild_callback(void *arg)
 }
 
 /*
+ * idxdefer_sort_mem
+ *		How much maintenance_work_mem to give the rebuild of one index, in kB.
+ *
+ * maintenance_work_mem is a ceiling, not an allocation: a tuplesort takes
+ * memory as the tuples arrive, so a large setting costs nothing by itself.
+ * What a ceiling close to the real need buys is the memtuples array.  It grows
+ * by doubling while the sort has used less than half its budget, so under a
+ * budget far above the data it can end up almost twice as large as the tuples
+ * need - at 24 bytes a slot, a few hundred megabytes on the inserts this module
+ * is for.  Under a budget sized to the data, its last growth step is
+ * proportional instead (see grow_memtuples()).  With many sessions rebuilding
+ * at once that is the difference that matters, and the report can say what
+ * each rebuild was given.
+ *
+ * The estimate is for a B-tree, whose build is one tuplesort holding a
+ * SortTuple and an IndexTuple for every heap row; a non-unique index has only
+ * the one spool (see _bt_spools_heapscan()).  Other access methods use
+ * maintenance_work_mem in their own ways and get the limit as it is.
+ *
+ * Two things are known exactly by now: the number of rows, which the statement
+ * counted, and the size of the heap.  The width of an index tuple is exact
+ * when every column of the index is a plain column of fixed length.  If not,
+ * it is bounded by the heap's footprint per row: an index tuple's header is
+ * smaller than a heap tuple's, and a plain column's value takes no more room
+ * in the index than in the heap.  (That fails for a value the heap keeps in
+ * TOAST, and is only a heuristic for an expression.)  Erring high costs
+ * little, since the ceiling is not allocated; erring low sends the sort to
+ * disk.  So the estimate errs high and gets a margin on top.
+ *
+ * Returns the setting to use, and the estimate itself in *estimate_kb, or -1
+ * there if the access method has none.
+ */
+static int
+idxdefer_sort_mem(IdxdeferTarget *target, Relation heap, Oid indexoid,
+				  BlockNumber heap_nblocks, int *estimate_kb)
+{
+	Relation	irel;
+	TupleDesc	itupdesc;
+	TupleDesc	heapdesc = RelationGetDescr(heap);
+	Form_pg_index index;
+	double		ntuples;
+	double		heap_width;
+	double		itup_width;
+	double		bytes;
+	Size		data = 0;
+	Size		header = sizeof(IndexTupleData);
+	bool		exact = true;
+
+	/* Still locked since idxdefer_collect_indexes(). */
+	irel = index_open(indexoid, NoLock);
+
+	if (irel->rd_rel->relam != BTREE_AM_OID)
+	{
+		index_close(irel, NoLock);
+		*estimate_kb = -1;
+		return idxdefer_maintenance_work_mem;
+	}
+
+	/*
+	 * es_processed counts the rows of this ModifyTable node, the only one in
+	 * the statement.  It stays zero for a statement that does not set the
+	 * command tag, such as a rule action; the planner's estimate is all there
+	 * is then.
+	 */
+	ntuples = (double) target->mtstate->ps.state->es_processed;
+	if (!target->mtstate->canSetTag || ntuples < 1.0)
+		ntuples = target->plan_rows;
+	ntuples = Max(ntuples, 1.0);
+
+	/* The heap tuple, its line pointer and its share of the free space. */
+	heap_width = (double) heap_nblocks * BLCKSZ / ntuples;
+
+	itupdesc = RelationGetDescr(irel);
+	index = irel->rd_index;
+
+	for (int i = 0; i < itupdesc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(itupdesc, i);
+		AttrNumber	heapattno = index->indkey.values[i];
+
+		/*
+		 * A column that can be null means a null bitmap in some tuples, which
+		 * moves the data to the next MAXALIGN boundary.
+		 */
+		if (heapattno == 0 ||
+			!TupleDescAttr(heapdesc, heapattno - 1)->attnotnull)
+			header = sizeof(IndexTupleData) + sizeof(IndexAttributeBitMapData);
+
+		if (heapattno == 0 || att->attlen <= 0)
+			exact = false;
+		else
+			data = att_align_nominal(data, att->attalign) + att->attlen;
+	}
+
+	index_close(irel, NoLock);
+
+	itup_width = (double) MAXALIGN(MAXALIGN(header) + data);
+	if (!exact)
+		itup_width = Max(itup_width, heap_width);
+
+	bytes = ntuples * (sizeof(SortTuple) + itup_width);
+
+	/* A quarter on top, and a megabyte for the sort's own bookkeeping. */
+	bytes = bytes * 1.25 + 1024.0 * 1024.0;
+
+	*estimate_kb = (int) Min(bytes / 1024.0, (double) MAX_KILOBYTES);
+
+	return Max(Min(*estimate_kb, idxdefer_maintenance_work_mem), 64);
+}
+
+/*
  * idxdefer_rebuild
  *		Rebuild the indexes a deferred INSERT did not maintain.
  *
@@ -571,6 +699,10 @@ idxdefer_rebuild(IdxdeferTarget *target, Instrumentation *account,
 		Oid			indexoid = lfirst_oid(lc);
 		ReindexParams params = {0};
 		char	   *indexname;
+		char		buf[32];
+		int			mem_kb;
+		int			estimate_kb;
+		int			save_nestlevel;
 		instr_time	start;
 		instr_time	elapsed;
 
@@ -583,11 +715,22 @@ idxdefer_rebuild(IdxdeferTarget *target, Instrumentation *account,
 			continue;
 		ctx.indexname = indexname;
 
+		mem_kb = idxdefer_sort_mem(target, rel, indexoid, nblocks,
+								   &estimate_kb);
+
 		if (report)
 			INSTR_TIME_SET_CURRENT(start);
 
+		save_nestlevel = NewGUCNestLevel();
+		snprintf(buf, sizeof(buf), "%dkB", mem_kb);
+		(void) set_config_option("maintenance_work_mem", buf,
+								 PGC_USERSET, PGC_S_SESSION,
+								 GUC_ACTION_SAVE, true, 0, false);
+
 		params.options = REINDEXOPT_MISSING_OK;
 		reindex_index(NULL, indexoid, false, RELPERSISTENCE_TEMP, &params);
+
+		AtEOXact_GUC(true, save_nestlevel);
 
 		CommandCounterIncrement();
 
@@ -599,11 +742,21 @@ idxdefer_rebuild(IdxdeferTarget *target, Instrumentation *account,
 			INSTR_TIME_SET_CURRENT(elapsed);
 			INSTR_TIME_SUBTRACT(elapsed, start);
 
-			ereport(idxdefer_log_level,
-					(errmsg("idxdefer: rebuilt index \"%s\"", indexname),
-					 errdetail("Rebuilt %s in %.3f ms.",
-							   idxdefer_point_names[point],
-							   INSTR_TIME_GET_MILLISEC(elapsed))));
+			if (estimate_kb >= 0)
+				ereport(idxdefer_log_level,
+						(errmsg("idxdefer: rebuilt index \"%s\"", indexname),
+						 errdetail("Rebuilt %s in %.3f ms with maintenance_work_mem = %d kB (estimated sort size %d kB, limit %d kB).",
+								   idxdefer_point_names[point],
+								   INSTR_TIME_GET_MILLISEC(elapsed),
+								   mem_kb, estimate_kb,
+								   idxdefer_maintenance_work_mem)));
+			else
+				ereport(idxdefer_log_level,
+						(errmsg("idxdefer: rebuilt index \"%s\"", indexname),
+						 errdetail("Rebuilt %s in %.3f ms with maintenance_work_mem = %d kB (the limit; no estimate for this access method).",
+								   idxdefer_point_names[point],
+								   INSTR_TIME_GET_MILLISEC(elapsed),
+								   mem_kb)));
 		}
 	}
 
@@ -678,6 +831,7 @@ idxdefer_defer(QueryDesc *queryDesc, ModifyTableState *mtstate,
 	target->orig_exec = mtstate->ps.ExecProcNodeReal;
 	target->relid = RelationGetRelid(rel);
 	target->indexes = list_copy(indexes);
+	target->plan_rows = rows;
 	target->subid = GetCurrentSubTransactionId();
 	target->state = IDXDEFER_PENDING;
 
@@ -1059,6 +1213,16 @@ idxdefer_init(void)
 							0, INT_MAX,
 							PGC_USERSET,
 							0,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("idxdefer.maintenance_work_mem",
+							"Upper limit on the memory for rebuilding one index of a deferred insert.",
+							"A B-tree rebuild gets the sort size estimated from the inserted rows, if that is smaller; other index types get this value.",
+							&idxdefer_maintenance_work_mem,
+							1024 * 1024,
+							64, MAX_KILOBYTES,
+							PGC_USERSET,
+							GUC_UNIT_KB,
 							NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("idxdefer");

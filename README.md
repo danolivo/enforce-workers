@@ -454,6 +454,35 @@ An `INSERT` qualifies when all of these hold:
 * the table has no pages when the statement starts;
 * the planner expects at least `idxdefer.min_rows` rows.
 
+### Memory for the rebuild
+
+When the rebuild starts the rows are in, so nothing has to be guessed from the
+plan: the statement counted them, and the heap's size bounds how wide they are.
+For a B-tree — one tuplesort of index tuples — that gives the sort size: 24
+bytes of `SortTuple` plus one index tuple per row, with a quarter and a megabyte
+on top. The tuple width is exact when every indexed column is a plain column of
+fixed length, and otherwise the heap's footprint per row, which no plain column
+can exceed in the index. Each index is rebuilt with `maintenance_work_mem` set
+to that estimate, or to `idxdefer.maintenance_work_mem` if the estimate is
+larger. Other index types get the limit as it is.
+
+`maintenance_work_mem` is a ceiling, not an allocation, so this does not save
+memory the sort would otherwise have taken for nothing. What it saves is the
+`memtuples` array: it grows by doubling while the sort has used less than half
+its budget, and under a budget far above the data it ends up to twice the size
+the tuples need; under a budget sized to the data, its last step is
+proportional. Measured on a million rows, with `trace_sort`:
+
+| index | estimate | tuplesort used |
+| --- | --- | --- |
+| `int NOT NULL` | 49 852 kB | 40 202 kB |
+| `(int NOT NULL, bigint)` | 69 383 kB | 48 014 kB |
+| `text` (md5) | 133 420 kB | 71 452 kB |
+| `bytea` (16 bytes, 1C-like table) | 113 660 kB | 55 827 kB |
+
+Every sort stayed in memory. The estimate errs high on purpose: erring high
+costs nothing, erring low sends the sort to disk.
+
 ### Why it is safe
 
 While the statement runs, the heap has rows the index does not know about.
@@ -489,6 +518,7 @@ the statement on an error.
 | `idxdefer.mode` | `on` | `off` leaves inserts alone; `log` reports the inserts that would be deferred; `on` defers them. |
 | `idxdefer.log_level` | `debug1` | Level at which deferrals and rebuilds are reported; the estimate is in the `DETAIL`. |
 | `idxdefer.min_rows` | `1000000` | Planner estimate below which an insert keeps its index maintenance. |
+| `idxdefer.maintenance_work_mem` | `1GB` | Upper limit on the memory for rebuilding one index. A B-tree gets the estimated sort size if that is smaller; other index types get this value. At least 64kB. |
 
 The default for `min_rows` comes from the stand: in a baseline run of the
 `cherkizovo` package, indexed temporary-table inserts of a million rows or more
@@ -499,8 +529,8 @@ are 98% of the index maintenance time, and those below a hundred thousand are
 
 * Put `enforce_workers` first in `shared_preload_libraries`; otherwise inserts
   whose plans run in parallel mode are not deferred.
-* A rebuild is a full index build, using up to `maintenance_work_mem` and, if
-  that is not enough, temporary files.
+* A rebuild is a full index build, using up to `idxdefer.maintenance_work_mem`
+  per index and, if that is not enough, temporary files.
 * The rebuild fills in `reltuples` and `relpages`, so later queries on the same
   table may be planned differently.
 * An error in an index expression is raised after all rows are in, from the
@@ -541,7 +571,10 @@ heap in any case. Covered:
   while the insert runs;
 * a deferred insert nested in a function called by another query, and one
   nested inside a deferred insert into the same table;
-* a GIN index.
+* a GIN index;
+* the memory the rebuild gets: an index expression reports
+  `maintenance_work_mem` while the rebuild evaluates it, once with the estimate
+  and once with `idxdefer.maintenance_work_mem` below it.
 
 Each of the three protections was checked by disabling it: without the rebuild,
 `amcheck` reports heap tuples missing from the index and index scans return
