@@ -1,0 +1,170 @@
+# Run PostgreSQL's own installcheck-world against a server that has
+# enforce_workers in shared_preload_libraries and the extension created in
+# every test database, and compare what changed with ci/baseline/<branch>.txt.
+#
+# The library changes plans by design, so the suite is expected to fail; what
+# must not happen is a failure nobody has seen before.  The job fails on:
+#   - a backend crash, an assertion failure or a PANIC in the server log;
+#   - a pg_regress/psql failure that is not a test diff;
+#   - a WARNING or worse raised from this library's own code that is new;
+#   - a test whose diff is new or different, ignoring pure row reorders.
+# See ci/deviations.py for how a diff is reduced before it is compared.
+#
+# To accept a change, take report.txt from the job's artifact and commit it
+# as ci/baseline/<branch>.txt.
+
+name: installcheck-world
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly, to see upstream changes to the stable branches.
+    - cron: '23 4 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  installcheck-world:
+    name: PostgreSQL ${{ matrix.pg }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    # master moves every day and its expected output with it: report, but do
+    # not fail the run.
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pg: REL_17_STABLE
+            experimental: false
+          - pg: REL_18_STABLE
+            experimental: false
+          - pg: master
+            experimental: true
+
+    env:
+      PGSRC: ${{ github.workspace }}/postgres
+      PGINST: ${{ github.workspace }}/pginst
+      PGDATA: ${{ github.workspace }}/pgdata
+      OUT: ${{ github.workspace }}/out
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            bison flex ccache pkg-config \
+            libreadline-dev zlib1g-dev libicu-dev libssl-dev \
+            libxml2-dev libxslt1-dev uuid-dev libperl-dev python3-dev
+
+      - name: Fetch PostgreSQL ${{ matrix.pg }}
+        run: |
+          git clone -q --depth 1 --branch '${{ matrix.pg }}' \
+            https://github.com/postgres/postgres.git "$PGSRC"
+          echo "PG_COMMIT=$(git -C "$PGSRC" rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          mkdir -p "$OUT"
+
+      - name: Check out enforce_workers into contrib/
+        uses: actions/checkout@v4
+        with:
+          path: postgres/contrib/enforce_workers
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ matrix.pg }}-${{ env.PG_COMMIT }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.pg }}-${{ env.PG_COMMIT }}-
+            ccache-${{ matrix.pg }}-
+
+      - name: Build and install PostgreSQL
+        working-directory: ${{ env.PGSRC }}
+        run: |
+          ./configure -q --prefix="$PGINST" \
+            --enable-debug --enable-cassert \
+            --with-openssl --with-libxml --with-libxslt --with-uuid=e2fs \
+            --with-perl --with-python \
+            CC='ccache gcc' CFLAGS='-O1 -ggdb'
+          make -s -j"$(nproc)" world-bin
+          make -s install-world-bin
+          ccache -s | head -5
+
+      - name: Build and install enforce_workers
+        working-directory: ${{ env.PGSRC }}/contrib/enforce_workers
+        run: |
+          make -s -j"$(nproc)" COPT='-Werror'
+          make -s install
+
+      - name: Start a server with enforce_workers preloaded
+        run: |
+          export PATH="$PGINST/bin:$PATH"
+          initdb -D "$PGDATA" --no-locale -E UTF8 -A trust >/dev/null
+          cat >> "$PGDATA/postgresql.conf" <<'EOF'
+          shared_preload_libraries = 'enforce_workers'
+          # LOCATION lines let ci/deviations.py tell this library's errors apart.
+          log_error_verbosity = verbose
+          log_line_prefix = '%m [%p] %b '
+          fsync = off
+          EOF
+          pg_ctl -D "$PGDATA" -l "$OUT/postmaster.log" -w start
+          psql -X -d postgres -Atc "SELECT version()"
+          psql -X -d postgres -Atc "SHOW shared_preload_libraries"
+
+      - name: make installcheck-world
+        working-directory: ${{ env.PGSRC }}
+        timeout-minutes: 90
+        run: |
+          export PATH="$PGINST/bin:$PATH"
+          # pg_regress builds every test database from template0, so the
+          # extension goes in through --load-extension; without it seqguard
+          # has no function to substitute and stays inert.
+          make -k installcheck-world \
+            EXTRA_REGRESS_OPTS='--load-extension=enforce_workers' \
+            > "$OUT/installcheck-world.log" 2>&1 || true
+          grep -E '^# (All|[0-9]+ of) [0-9]+ tests' "$OUT/installcheck-world.log" || true
+
+      - name: The extension's own tests on the same server
+        working-directory: ${{ env.PGSRC }}/contrib/enforce_workers
+        run: |
+          export PATH="$PGINST/bin:$PATH"
+          make installcheck > "$OUT/enforce_workers-installcheck.log" 2>&1 || true
+          cat "$OUT/enforce_workers-installcheck.log"
+
+      - name: Collect deviations
+        run: |
+          export PATH="$PGINST/bin:$PATH"
+          alive=no
+          pg_ctl -D "$PGDATA" status >/dev/null && alive=yes
+          cat "$OUT/installcheck-world.log" "$OUT/enforce_workers-installcheck.log" \
+            > "$OUT/make.log"
+          python3 "$PGSRC/contrib/enforce_workers/ci/deviations.py" collect \
+            --src "$PGSRC" \
+            --log "$OUT/postmaster.log" \
+            --make-log "$OUT/make.log" \
+            --server-alive "$alive" \
+            --label "${{ matrix.pg }} $PG_COMMIT" > "$OUT/report.txt"
+          pg_ctl -D "$PGDATA" -m fast stop || true
+          # Every raw diff, for reading the report in context.
+          find "$PGSRC" -name regression.diffs -not -path '*/tmp_check/*' \
+            -printf '%P\n' | sort | tar -C "$PGSRC" -czf "$OUT/regression-diffs.tar.gz" -T -
+
+      - name: Compare with ci/baseline/${{ matrix.pg }}.txt
+        run: |
+          python3 "$PGSRC/contrib/enforce_workers/ci/deviations.py" compare \
+            "$PGSRC/contrib/enforce_workers/ci/baseline/${{ matrix.pg }}.txt" \
+            "$OUT/report.txt"
+
+      - name: Upload report and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installcheck-world-${{ matrix.pg }}
+          path: ${{ env.OUT }}
+          retention-days: 30
