@@ -1,0 +1,92 @@
+LOAD 'enforce_workers';
+
+-- This file is about the relation-size gate and nothing else, so keep the
+-- other three features out of the plans.
+SET nlguard.mode = off;
+SET seqguard.mode = off;
+SET idxdefer.mode = off;
+
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+
+-- min_parallel_table_scan_size is deliberately left at its default.  That gate
+-- is the whole subject here: the table below is far smaller than 8MB, so
+-- without this module it gets no partial path at any cost setting.
+CREATE TABLE ew_small (a int);
+INSERT INTO ew_small SELECT i FROM generate_series(1, 1000) i;
+VACUUM ANALYZE ew_small;
+
+SELECT pg_relation_size('ew_small')
+         < pg_size_bytes(current_setting('min_parallel_table_scan_size'))
+  AS below_the_gate;
+
+-- The module is active from the moment the library is loaded.
+SHOW enforce_workers.mode;
+
+--
+-- off is the core planner, unchanged: too small to be worth a worker.
+--
+SET enforce_workers.mode = off;
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM ew_small;
+
+--
+-- on fills in rel_parallel_workers, which is the field the size test is
+-- skipped for, and the partial path appears.
+--
+SET enforce_workers.mode = on;
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM ew_small;
+
+--
+-- The parallel_workers storage parameter still wins, in either direction.  It
+-- is an explicit decision by whoever set it, and 0 is a decision too.
+--
+ALTER TABLE ew_small SET (parallel_workers = 0);
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM ew_small;
+
+ALTER TABLE ew_small RESET (parallel_workers);
+
+--
+-- log mode names the relations it would have acted on, and changes nothing.
+-- The storage parameter case above is reported by neither mode, because the
+-- test that skips it comes first.
+--
+SET enforce_workers.mode = log;
+SET enforce_workers.log_level = notice;
+\set VERBOSITY terse
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM ew_small;
+
+ALTER TABLE ew_small SET (parallel_workers = 0);
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM ew_small;
+
+ALTER TABLE ew_small RESET (parallel_workers);
+
+-- and on mode says what it did
+SET enforce_workers.mode = on;
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM ew_small;
+
+\set VERBOSITY default
+RESET enforce_workers.log_level;
+
+--
+-- The rows are the same either way.
+--
+SET enforce_workers.mode = off;
+SELECT count(*), sum(a) FROM ew_small;
+
+SET enforce_workers.mode = on;
+SELECT count(*), sum(a) FROM ew_small;
+
+DROP TABLE ew_small;

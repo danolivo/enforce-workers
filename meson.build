@@ -31,6 +31,7 @@ tests += {
   'bd': meson.current_build_dir(),
   'regress': {
     'sql': [
+      'enforce_workers',
       'nlguard',
       'seqguard',
       'idxdefer',
