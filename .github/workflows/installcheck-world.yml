@@ -70,14 +70,16 @@ jobs:
         with:
           path: postgres/contrib/enforce_workers
 
+      # Restore and save are separate steps: the job is expected to fail
+      # whenever the deviations change, and a combined actions/cache step
+      # saves nothing from a failed job.
       - name: Restore ccache
-        uses: actions/cache@v6
+        id: ccache
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ matrix.pg }}-${{ env.PG_COMMIT }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ matrix.pg }}-${{ env.PG_COMMIT }}-
-            ccache-${{ matrix.pg }}-
+          key: ccache-${{ matrix.pg }}-${{ env.PG_COMMIT }}
+          restore-keys: ccache-${{ matrix.pg }}-
 
       - name: Build and install PostgreSQL
         working-directory: ${{ env.PGSRC }}
@@ -90,6 +92,13 @@ jobs:
           make -s -j"$(nproc)" world-bin
           make -s install-world-bin
           ccache -s | head -5
+
+      - name: Save ccache
+        if: steps.ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ matrix.pg }}-${{ env.PG_COMMIT }}
 
       - name: Build and install enforce_workers
         working-directory: ${{ env.PGSRC }}/contrib/enforce_workers
