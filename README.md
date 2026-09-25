@@ -5,11 +5,10 @@ module: `enforce_workers` below, then `nlguard`, `seqguard` and `idxdefer`.
 Each lives in its own file and can be switched off independently; `_PG_init()`
 is the only entry point.
 
-**All four are active the moment the library is loaded.** `enforce_workers`
-has no switch at all, and `nlguard.mode`, `seqguard.mode` and `idxdefer.mode`
-all default to `on`. Loading this library changes plans — that is what it is
-for — so do not put it in `shared_preload_libraries` of a server you have not
-measured it on.
+**All four are active the moment the library is loaded**: `enforce_workers.mode`,
+`nlguard.mode`, `seqguard.mode` and `idxdefer.mode` all default to `on`. Loading
+this library changes plans — that is what it is for — so do not put it in
+`shared_preload_libraries` of a server you have not measured it on.
 
 How much it changes, measured: with the library preloaded, PostgreSQL's own
 regression suite fails **24 of 231** tests. `enforce_workers` alone accounts for
@@ -39,6 +38,40 @@ carry an explicit `parallel_workers` storage parameter.
 That is the same field the storage parameter writes, so the effect is identical
 to running `ALTER TABLE ... SET (parallel_workers = N)` on everything — without
 touching a single catalog row.
+
+### GUCs
+
+| name | type | default | meaning |
+|---|---|---|---|
+| `enforce_workers.mode` | enum | `on` | `off` / `log` / `on` |
+| `enforce_workers.log_level` | enum | `debug1` | level for the report, as in `auto_explain` |
+
+`off` gives the core planner back, unchanged — the size gate applies again and
+nothing else in the module is affected. `log` names every relation the override
+would have acted on and changes no plan, which is the cheap way to find out how
+wide the blast radius is on a given workload before widening it.
+
+A relation carrying an explicit `parallel_workers` storage parameter is skipped
+before the report, so neither mode mentions it. That is deliberate: the report
+lists exactly what `on` would change.
+
+The hook runs once per base relation per planning cycle, so raising
+`enforce_workers.log_level` on a busy system puts a line in the log for every
+table in every query. `debug1` with `log_min_messages` turned up for the
+duration of a run is the safer way round.
+
+### Tests
+
+`sql/enforce_workers.sql` is the one file in the suite that leaves
+`min_parallel_table_scan_size` at its default, because that gate is its whole
+subject. It covers:
+
+* a table verifiably below the gate getting no partial path with `mode = off`
+  and a `Gather` with `mode = on`;
+* `parallel_workers = 0` on the table beating the module in both modes;
+* `log` mode naming the relation and changing no plan — and saying nothing
+  about a relation whose storage parameter had already excluded it;
+* the same rows coming back either way.
 
 ## nlguard
 
@@ -628,15 +661,17 @@ reports success and changes nothing. `SHOW seqguard.mode` returning a value is
 not evidence that the module is running; a substitution reported at
 `seqguard.log_level`, or `seqguard_nextval` appearing in `EXPLAIN VERBOSE`, is.
 
-To load the library for one override only:
+All four have the same switch, so the library can be loaded for any subset of
+them — leave the one you want at its default and turn the rest off:
 
     LOAD 'enforce_workers';
-    SET nlguard.mode = off;          -- and leave seqguard.mode alone, or
-    SET seqguard.mode = off;         -- parallelism override only
+    SET enforce_workers.mode = off;  -- no relation-size override
+    SET nlguard.mode = off;          -- no nested loop policy
+    SET seqguard.mode = off;         -- no nextval substitution
     SET idxdefer.mode = off;         -- no index maintenance deferral
 
-`enforce_workers` has no equivalent switch; unload the library to be rid of
-it.
+All four are `PGC_USERSET`, so a session can turn any of them off for itself
+without touching the server's configuration.
 
 ## Caveats (enforce_workers)
 
@@ -650,3 +685,6 @@ it.
   at run time — expect `Workers Planned: 4, Workers Launched: 1`.
 * The query must be parallel-safe to begin with; this module does not change
   `consider_parallel`.
+* `enforce_workers.mode = off` stops the override from that point on, but plans
+  already built and cached keep the shape they were given. The GUC is read in
+  `get_relation_info_hook`, which only runs when something is planned.

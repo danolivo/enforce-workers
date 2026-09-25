@@ -13,7 +13,7 @@ DATA = enforce_workers--1.0.sql
 
 PGFILEDESC = "enforce_workers - planner overrides for parallelism and nested loops"
 
-REGRESS = nlguard seqguard idxdefer
+REGRESS = enforce_workers nlguard seqguard idxdefer
 
 # idxdefer's test verifies the rebuilt indexes with amcheck when it is there.
 EXTRA_INSTALL = contrib/amcheck
