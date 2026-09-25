@@ -32,19 +32,14 @@ jobs:
     name: PostgreSQL ${{ matrix.pg }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
-    # master moves every day and its expected output with it: report, but do
-    # not fail the run.
-    continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - pg: REL_17_STABLE
-            experimental: false
-          - pg: REL_18_STABLE
-            experimental: false
-          - pg: master
-            experimental: true
+        # Only 18 builds.  17 has no Path.disabled_nodes and no PRId64 in
+        # elog formats; master (19devel) has lost get_relation_info_hook,
+        # QueryDesc.totaltime, and gave planner_hook an ExplainState argument.
+        # A branch added here needs its own ci/baseline/<branch>.txt.
+        pg: [REL_18_STABLE]
 
     env:
       PGSRC: ${{ github.workspace }}/postgres
@@ -71,12 +66,12 @@ jobs:
           mkdir -p "$OUT"
 
       - name: Check out enforce_workers into contrib/
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: postgres/contrib/enforce_workers
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ env.CCACHE_DIR }}
           key: ccache-${{ matrix.pg }}-${{ env.PG_COMMIT }}-${{ github.sha }}
@@ -163,7 +158,7 @@ jobs:
 
       - name: Upload report and logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: installcheck-world-${{ matrix.pg }}
           path: ${{ env.OUT }}
