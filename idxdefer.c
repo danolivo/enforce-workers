@@ -88,10 +88,13 @@
  * Why this is safe
  * ----------------
  * The target is empty when the statement starts, belongs to this backend, and
- * has no triggers, no unique or exclusion indexes and no ON CONFLICT clause:
- * nothing needs the index to decide what happens to a row.  So the state in
- * between - rows in the heap that the index does not know about - can only be
- * observed by reading the table, and can only outlive the statement on error.
+ * has no triggers, no exclusion indexes and no ON CONFLICT clause, and unless
+ * idxdefer.defer_unique_indexes is on, no unique indexes either: nothing needs
+ * the index to decide what happens to a row.  So the state in between - rows
+ * in the heap that the index does not know about - can only be observed by
+ * reading the table, and can only outlive the statement on error.  (A unique
+ * index does decide what happens to a row, whether it goes in or raises an
+ * error; see "Unique indexes" below for why deferring that decision is safe.)
  *
  * 1.  The statement itself reading the target.  Its own rows are invisible to
  *     its own snapshot, and the table was empty, so any scan in it sees
@@ -124,6 +127,50 @@
  *     repair, and the transaction and subtransaction callbacks below only have
  *     to forget what they were told.  A deferral that is somehow still pending
  *     at commit is refused there, because the table outlives the transaction.
+ *
+ * Unique indexes
+ * --------------
+ * With idxdefer.defer_unique_indexes on, a unique index - a primary key
+ * included - is deferred like any other, and the duplicate check moves from
+ * each row to the rebuild, which is the check CREATE UNIQUE INDEX on a filled
+ * table makes.  The build checks every tuple that is alive to this
+ * transaction, which on a table that started empty means every row that could
+ * have conflicted row by row; tuples this transaction has deleted, and those
+ * of aborted subtransactions, are not checked, just as _bt_check_unique()
+ * would not have counted them.  So a duplicate is never let through.  What
+ * changes for the statement alone is when it fails: after all its rows are
+ * in, not on the second row of the pair.  The error has the same SQLSTATE
+ * (unique_violation) and names the same constraint, but its message is the
+ * one CREATE UNIQUE INDEX gives, and it may name another pair of keys.
+ *
+ * Deferrable constraints are never deferred.  They already check at the end
+ * of the statement or transaction through a trigger, which the "no triggers"
+ * rule excludes anyway; the index must also be indimmediate, so that the rule
+ * does not rest on that coincidence.  Exclusion constraints are never
+ * deferred at all: their check is not the sort-and-compare of a B-tree build.
+ *
+ * Limitations.  This is written for 1C, which never gives the check anything
+ * to catch, and it relies on that rather than guarding against it:
+ *
+ *   - No other statement may write to the table while the insert runs.  A
+ *     VOLATILE function in the source query, or a trigger on another table,
+ *     that inserts or updates rows of the target would check its own rows
+ *     against a unique index that lacks the rows inserted so far, and an
+ *     ON CONFLICT or an exception handler in it would decide wrongly.  The
+ *     final rebuild would still refuse the duplicate, as an error, so nothing
+ *     wrong can be committed; but a statement that meant to handle the
+ *     conflict fails instead.  Writers that go through the executor are
+ *     refused with an error before they start (idxdefer_check_writer()); COPY
+ *     does not, and is only caught by the rebuild.
+ *
+ *   - A statement that runs into a duplicate fails later and differently, as
+ *     described above.  Everything its source query does before that - rows
+ *     computed, sequence values drawn, notices raised - happens for all the
+ *     rows, not only up to the duplicate.
+ *
+ * A non-unique index needs none of this: a statement writing to the table in
+ * the meantime maintains the stale index for its own purposes, and the rebuild
+ * replaces it.
  *
  * What it costs
  * -------------
@@ -161,6 +208,7 @@
 #include "nodes/pathnodes.h"
 #include "nodes/plannodes.h"
 #include "optimizer/plancat.h"
+#include "parser/parsetree.h"
 #include "portability/instr_time.h"
 #include "storage/bufmgr.h"
 #include "storage/itemid.h"
@@ -209,6 +257,7 @@ static int	idxdefer_mode = IDXDEFER_ON;
 static int	idxdefer_log_level = DEBUG1;
 static int	idxdefer_min_rows = 1000000;
 static int	idxdefer_maintenance_work_mem = 1024 * 1024;	/* 1GB, in kB */
+static bool idxdefer_defer_unique_indexes = false;
 
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun = NULL;
@@ -247,6 +296,7 @@ typedef struct IdxdeferTarget
 	ExecProcNodeMtd orig_exec;	/* what the node ran before we wrapped it */
 	Oid			relid;			/* its target table */
 	List	   *indexes;		/* OIDs of the indexes to rebuild */
+	int			nunique;		/* how many of them are unique */
 	double		plan_rows;		/* the planner's estimate, as a fallback */
 	SubTransactionId subid;		/* subtransaction it was registered in */
 	IdxdeferState state;
@@ -268,6 +318,13 @@ static const char *const idxdefer_point_names[] = {
 	[IDXDEFER_AT_END] = "in ExecutorEnd",
 };
 
+/* Name of the index being rebuilt, for the error context callback. */
+typedef struct IdxdeferRebuildContext
+{
+	const char *indexname;
+	bool		isunique;
+} IdxdeferRebuildContext;
+
 /*
  * The deferrals in progress, innermost last.  Everything here, the list
  * included, lives in TopTransactionContext: an entry is still consulted in
@@ -285,12 +342,6 @@ static const char *const idxdefer_point_names[] = {
  * has none.
  */
 static List *idxdefer_targets = NIL;
-
-/* Name of the index being rebuilt, for the error context callback. */
-typedef struct IdxdeferRebuildContext
-{
-	const char *indexname;
-} IdxdeferRebuildContext;
 
 /*
  * idxdefer_find_target
@@ -400,20 +451,25 @@ idxdefer_get_relation_info(PlannerInfo *root, Oid relationObjectId,
  * idxdefer_collect_indexes
  *		List the table's indexes, or NIL if any of them rules the table out.
  *
- * A unique or exclusion index is checked while each row goes in, so it cannot
- * be left behind; an index that is not ready, not valid or not live is in the
- * middle of something we should not interfere with.  One that is already open
- * - by a cursor, or by a scan in this very statement - would make the rebuild
- * fail in CheckTableNotInUse(), so it rules the table out too.
+ * An exclusion index is checked while each row goes in, by operators a build
+ * does not apply, so it cannot be left behind.  A unique one can, if
+ * idxdefer.defer_unique_indexes allows it and its check is immediate (see
+ * "Unique indexes" at the top of the file); *nunique counts them.  An index
+ * that is not ready, not valid or not live is in the middle of something we
+ * should not interfere with.  One that is already open - by a cursor, or by a
+ * scan in this very statement - would make the rebuild fail in
+ * CheckTableNotInUse(), so it rules the table out too.
  *
  * The indexes are locked in RowExclusiveLock, which is what ExecOpenIndices()
  * would have taken for the insert, and the locks are kept.
  */
 static List *
-idxdefer_collect_indexes(Relation rel)
+idxdefer_collect_indexes(Relation rel, int *nunique)
 {
 	List	   *indexoids = RelationGetIndexList(rel);
 	ListCell   *lc;
+
+	*nunique = 0;
 
 	foreach(lc, indexoids)
 	{
@@ -426,15 +482,20 @@ idxdefer_collect_indexes(Relation rel)
 		index = irel->rd_index;
 
 		usable = (index->indisvalid && index->indisready &&
-				  index->indislive &&
-				  !index->indisunique && !index->indisexclusion &&
+				  index->indislive && !index->indisexclusion &&
+				  (!index->indisunique ||
+				   (idxdefer_defer_unique_indexes && index->indimmediate)) &&
 				  irel->rd_refcnt == 1);
+
+		if (index->indisunique)
+			(*nunique)++;
 
 		index_close(irel, NoLock);
 
 		if (!usable)
 		{
 			list_free(indexoids);
+			*nunique = 0;
 			return NIL;
 		}
 	}
@@ -445,10 +506,36 @@ idxdefer_collect_indexes(Relation rel)
 /*
  * idxdefer_report
  *		Say what is being, or would be, done to the indexes of one table.
+ *
+ * A deferred unique index is said so in the primary message, which is the
+ * part that survives terse verbosity: a duplicate key is then reported by the
+ * rebuild, after all the rows are in, in the words of CREATE UNIQUE INDEX, and
+ * whoever is looking at that error in the log should find the reason next to
+ * it.
  */
 static void
-idxdefer_report(Relation rel, int nindexes, double rows, bool acting)
+idxdefer_report(Relation rel, int nindexes, int nunique, double rows,
+				bool acting)
 {
+	if (nunique > 0)
+	{
+		if (acting)
+			ereport(idxdefer_log_level,
+					(errmsg("idxdefer: deferring index maintenance on \"%s\", unique checks included",
+							RelationGetRelationName(rel)),
+					 errdetail_plural("%d index will be rebuilt after the insert, %d of them unique, so a duplicate key is only reported then; the planner expects %.0f rows.",
+									  "%d indexes will be rebuilt after the insert, %d of them unique, so a duplicate key is only reported then; the planner expects %.0f rows.",
+									  nindexes, nindexes, nunique, rows)));
+		else
+			ereport(idxdefer_log_level,
+					(errmsg("idxdefer: would defer index maintenance on \"%s\", unique checks included",
+							RelationGetRelationName(rel)),
+					 errdetail_plural("%d index would be rebuilt after the insert, %d of them unique; the planner expects %.0f rows.",
+									  "%d indexes would be rebuilt after the insert, %d of them unique; the planner expects %.0f rows.",
+									  nindexes, nindexes, nunique, rows)));
+		return;
+	}
+
 	if (acting)
 		ereport(idxdefer_log_level,
 				(errmsg("idxdefer: deferring index maintenance on \"%s\"",
@@ -479,8 +566,14 @@ idxdefer_rebuild_callback(void *arg)
 	IdxdeferRebuildContext *ctx = (IdxdeferRebuildContext *) arg;
 
 	if (ctx->indexname != NULL)
-		errcontext("rebuilding index \"%s\" after an INSERT that deferred its maintenance",
-				   ctx->indexname);
+	{
+		if (ctx->isunique)
+			errcontext("rebuilding unique index \"%s\" after an INSERT that deferred its maintenance, and with it the check for duplicate keys",
+					   ctx->indexname);
+		else
+			errcontext("rebuilding index \"%s\" after an INSERT that deferred its maintenance",
+					   ctx->indexname);
+	}
 }
 
 /*
@@ -499,9 +592,13 @@ idxdefer_rebuild_callback(void *arg)
  * each rebuild was given.
  *
  * The estimate is for a B-tree, whose build is one tuplesort holding a
- * SortTuple and an IndexTuple for every heap row; a non-unique index has only
- * the one spool (see _bt_spools_heapscan()).  Other access methods use
- * maintenance_work_mem in their own ways and get the limit as it is.
+ * SortTuple and an IndexTuple for every heap row (see _bt_spools_heapscan()).
+ * A unique index has a second spool, for the tuples that are not alive and
+ * so escape the duplicate check, but it is sized by work_mem, not by this,
+ * and on a table that started empty it only ever holds the rows deleted while
+ * the statement ran - so the estimate is the same for both.  Other access
+ * methods use maintenance_work_mem in their own ways and get the limit as it
+ * is.
  *
  * Two things are known exactly by now: the number of rows, which the statement
  * counted, and the size of the heap.  The width of an index tuple is exact
@@ -690,6 +787,7 @@ idxdefer_rebuild(IdxdeferTarget *target, Instrumentation *account,
 	}
 
 	ctx.indexname = NULL;
+	ctx.isunique = false;
 	errcallback.callback = idxdefer_rebuild_callback;
 	errcallback.arg = &ctx;
 	errcallback.previous = error_context_stack;
@@ -699,6 +797,7 @@ idxdefer_rebuild(IdxdeferTarget *target, Instrumentation *account,
 	{
 		Oid			indexoid = lfirst_oid(lc);
 		ReindexParams params = {0};
+		Relation	irel;
 		char	   *indexname;
 		char		buf[32];
 		int			mem_kb;
@@ -715,6 +814,11 @@ idxdefer_rebuild(IdxdeferTarget *target, Instrumentation *account,
 		if (indexname == NULL)
 			continue;
 		ctx.indexname = indexname;
+
+		/* Still locked since idxdefer_collect_indexes(). */
+		irel = index_open(indexoid, NoLock);
+		ctx.isunique = irel->rd_index->indisunique;
+		index_close(irel, NoLock);
 
 		mem_kb = idxdefer_sort_mem(target, rel, indexoid, nblocks,
 								   &estimate_kb);
@@ -818,7 +922,7 @@ idxdefer_ExecModifyTable(PlanState *pstate)
  */
 static void
 idxdefer_defer(QueryDesc *queryDesc, ModifyTableState *mtstate,
-			   ResultRelInfo *rri, List *indexes, double rows)
+			   ResultRelInfo *rri, List *indexes, int nunique, double rows)
 {
 	Relation	rel = rri->ri_RelationDesc;
 	MemoryContext oldcontext;
@@ -832,6 +936,7 @@ idxdefer_defer(QueryDesc *queryDesc, ModifyTableState *mtstate,
 	target->orig_exec = mtstate->ps.ExecProcNodeReal;
 	target->relid = RelationGetRelid(rel);
 	target->indexes = list_copy(indexes);
+	target->nunique = nunique;
 	target->plan_rows = rows;
 	target->subid = GetCurrentSubTransactionId();
 	target->state = IDXDEFER_PENDING;
@@ -881,7 +986,48 @@ idxdefer_defer(QueryDesc *queryDesc, ModifyTableState *mtstate,
 	/* Rebuild the moment the node is done; see the top of the file. */
 	ExecSetExecProcNode(&mtstate->ps, idxdefer_ExecModifyTable);
 
-	idxdefer_report(rel, list_length(indexes), rows, true);
+	idxdefer_report(rel, list_length(indexes), nunique, rows, true);
+}
+
+/*
+ * idxdefer_check_writer
+ *		Refuse a statement that writes to the table of a pending deferral with
+ *		unique indexes.
+ *
+ * Its own rows would be checked against unique indexes that lack the rows
+ * inserted so far; see "Limitations" at the top of the file.  1C never does
+ * this, so there is no attempt to make it work - only to make sure it cannot
+ * quietly behave differently.  Called from ExecutorStart before the standard
+ * processing, so the statement has done nothing yet.
+ *
+ * Only a write through the target itself is recognised.  A partitioned
+ * ancestor cannot be the target of a deferred insert, and a write routed
+ * through one is left to the final rebuild, as COPY is.
+ */
+static void
+idxdefer_check_writer(PlannedStmt *pstmt)
+{
+	ListCell   *lc;
+
+	foreach(lc, pstmt->resultRelations)
+	{
+		Oid			relid = rt_fetch(lfirst_int(lc), pstmt->rtable)->relid;
+		ListCell   *lc2;
+
+		foreach(lc2, idxdefer_targets)
+		{
+			IdxdeferTarget *target = (IdxdeferTarget *) lfirst(lc2);
+
+			if (target->relid == relid && target->nunique > 0 &&
+				target->state != IDXDEFER_DONE)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot write to table \"%s\" while an insert into it defers its unique checks",
+								get_rel_name(relid)),
+						 errdetail("The statement would check its rows against unique indexes that do not yet contain the rows inserted so far."),
+						 errhint("Set idxdefer.defer_unique_indexes to off.")));
+		}
+	}
 }
 
 /*
@@ -912,6 +1058,7 @@ idxdefer_consider(QueryDesc *queryDesc)
 	Relation	rel;
 	Plan	   *subplan;
 	List	   *indexes;
+	int			nunique;
 
 	/*
 	 * RETURNING and data-modifying CTEs put the INSERT in a portal that other
@@ -973,7 +1120,7 @@ idxdefer_consider(QueryDesc *queryDesc)
 	if (RelationGetNumberOfBlocks(rel) != 0)
 		return;
 
-	indexes = idxdefer_collect_indexes(rel);
+	indexes = idxdefer_collect_indexes(rel, &nunique);
 	if (indexes == NIL)
 		return;
 
@@ -997,9 +1144,11 @@ idxdefer_consider(QueryDesc *queryDesc)
 	}
 
 	if (idxdefer_mode == IDXDEFER_ON)
-		idxdefer_defer(queryDesc, mtstate, rri, indexes, subplan->plan_rows);
+		idxdefer_defer(queryDesc, mtstate, rri, indexes, nunique,
+					   subplan->plan_rows);
 	else
-		idxdefer_report(rel, list_length(indexes), subplan->plan_rows, false);
+		idxdefer_report(rel, list_length(indexes), nunique,
+						subplan->plan_rows, false);
 
 	list_free(indexes);
 }
@@ -1007,10 +1156,19 @@ idxdefer_consider(QueryDesc *queryDesc)
 /*
  * idxdefer_ExecutorStart
  *		ExecutorStart_hook entry point.
+ *
+ * A statement that writes to the table of a pending deferral with unique
+ * indexes is refused first, whatever idxdefer.mode says by now; see
+ * idxdefer_check_writer().
  */
 static void
 idxdefer_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
+	if (idxdefer_targets != NIL &&
+		queryDesc->plannedstmt->resultRelations != NIL &&
+		(eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
+		idxdefer_check_writer(queryDesc->plannedstmt);
+
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
 	else
@@ -1225,6 +1383,15 @@ idxdefer_init(void)
 							PGC_USERSET,
 							GUC_UNIT_KB,
 							NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("idxdefer.defer_unique_indexes",
+							 "Allows deferring the maintenance of unique indexes and primary keys.",
+							 "When on, a table with unique indexes qualifies like any other, and a duplicate key among the inserted rows is reported by the rebuild, after all the rows are in, rather than on the row that causes it.",
+							 &idxdefer_defer_unique_indexes,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("idxdefer");
 

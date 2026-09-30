@@ -142,6 +142,73 @@ CREATE INDEX pk_b ON pk (b);
 INSERT INTO pk SELECT i, i FROM generate_series(1, 5000) i;
 SELECT idx_ok('pk_pkey'), idx_ok('pk_b');
 
+--
+-- idxdefer.defer_unique_indexes: unique indexes and primary keys are deferred
+-- too, and the duplicate check moves from each row to the rebuild.
+--
+SET idxdefer.defer_unique_indexes = on;
+
+-- No duplicates: rebuilt and valid, NULLs in a unique column allowed as
+-- usual, and the rebuilt key enforces uniqueness row by row afterwards.
+CREATE TEMP TABLE upk (a int PRIMARY KEY, b int);
+CREATE UNIQUE INDEX upk_b ON upk (b);
+SELECT idx_node('upk_pkey') AS upk_before \gset
+INSERT INTO upk
+	SELECT i, CASE WHEN i % 2 = 0 THEN NULL ELSE -i END
+	FROM generate_series(1, 5000) i;
+SELECT idx_node('upk_pkey') <> :upk_before AS rebuilt,
+	   idx_ok('upk_pkey'), idx_ok('upk_b'), count(*), count(b) FROM upk;
+INSERT INTO upk VALUES (42, 0);
+
+-- A duplicate in the middle of the stream: every row goes in, the rebuild
+-- refuses, and nothing is left behind - the old index, and no live rows.
+TRUNCATE upk;
+SELECT idx_node('upk_pkey') AS upk_before \gset
+INSERT INTO upk
+	SELECT CASE WHEN i = 2500 THEN 1 ELSE i END, NULL
+	FROM generate_series(1, 5000) i;
+SELECT idx_node('upk_pkey') = :upk_before AS untouched,
+	   idx_ok('upk_pkey'), idx_ok('upk_b'), count(*) FROM upk;
+
+-- The error has the SQLSTATE the row-by-row check raises.
+CREATE TEMP TABLE upk_err (a int PRIMARY KEY);
+DO $$
+BEGIN
+	INSERT INTO upk_err SELECT i % 3000 FROM generate_series(1, 5000) i;
+EXCEPTION WHEN unique_violation THEN
+	RAISE NOTICE 'caught unique_violation';
+END
+$$;
+SELECT idx_ok('upk_err_pkey'), count(*) FROM upk_err;
+
+-- A deferrable key and an exclusion constraint are still left alone.
+CREATE TEMP TABLE upk_def (a int PRIMARY KEY DEFERRABLE);
+SELECT idx_node('upk_def_pkey') AS upk_def_before \gset
+INSERT INTO upk_def SELECT generate_series(1, 5000);
+SELECT idx_node('upk_def_pkey') = :upk_def_before AS untouched,
+	   idx_ok('upk_def_pkey');
+CREATE TEMP TABLE upk_excl (a int, EXCLUDE USING btree (a WITH =));
+SELECT idx_node('upk_excl_a_excl') AS upk_excl_before \gset
+INSERT INTO upk_excl SELECT generate_series(1, 5000);
+SELECT idx_node('upk_excl_a_excl') = :upk_excl_before AS untouched,
+	   idx_ok('upk_excl_a_excl');
+
+-- Another statement writing to the table during the insert would check its
+-- rows against an incomplete unique index; it is refused before it starts.
+CREATE TEMP TABLE upk_w (a int PRIMARY KEY);
+CREATE FUNCTION upk_write(k int) RETURNS int LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+	IF k = 2500 THEN
+		INSERT INTO upk_w VALUES (-1);
+	END IF;
+	RETURN k;
+END
+$$;
+INSERT INTO upk_w SELECT upk_write(i) FROM generate_series(1, 5000) i;
+SELECT idx_ok('upk_w_pkey'), count(*) FROM upk_w;
+
+RESET idxdefer.defer_unique_indexes;
+
 -- ON CONFLICT, even with nothing to conflict on.
 CREATE TEMP TABLE onconf (a int);
 CREATE INDEX onconf_a ON onconf (a);
@@ -436,6 +503,7 @@ SET idxdefer.maintenance_work_mem = 1;
 RESET idxdefer.maintenance_work_mem;
 SHOW idxdefer.maintenance_work_mem;
 
+DROP FUNCTION upk_write(int);
 DROP FUNCTION fill_nest();
 DROP FUNCTION fill_nest2(int);
 DROP FUNCTION upd_touch(int);

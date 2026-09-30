@@ -40,9 +40,11 @@ nothing is reported unless the refusal is about hook order (see
   row. Only `TRUNCATE` (or a new table) makes it eligible again.
 * **Any trigger disqualifies the table**, including the internal triggers of a
   foreign key — on either side of it — and statement-level triggers.
-* **Any unique, primary-key or exclusion index disqualifies the whole table**,
-  not just that index: one index that must be maintained row by row means the
-  executor has to open them all.
+* **Any exclusion index disqualifies the whole table**, not just that index:
+  one index that must be maintained row by row means the executor has to open
+  them all. So does any unique or primary-key index while
+  `idxdefer.defer_unique_indexes` is off (the default), and a deferrable one
+  always.
 * **An index that is already open disqualifies the table.** A cursor in the same
   transaction that scans the target through an index is enough.
 * **`RETURNING`, `ON CONFLICT` (any form) and data-modifying CTEs are never
@@ -246,6 +248,15 @@ Other points:
   `CONTEXT` line naming the index. The statement fails either way and nothing
   is left behind, but the time spent inserting is wasted and the error looks
   different to anything parsing it.
+* **Duplicate keys are reported by the rebuild** when
+  `idxdefer.defer_unique_indexes` is on: after all rows are in, as `could not
+  create unique index`, naming whichever duplicate the sort meets first. Same SQLSTATE
+  and constraint name; the statement fails as a whole either way. The source
+  query's side effects happen for every row first. See the README.
+* **Writing to the target during a deferred insert with unique indexes is an
+  error** — from a `VOLATILE` function in the source or a trigger elsewhere —
+  where without the module it would work. 1C never does this. `COPY` is not
+  intercepted; a duplicate it adds is caught by the rebuild.
 * **Index expressions run in a maintenance context.** `reindex_index()` runs
   them as the table owner, under `SECURITY_RESTRICTED_OPERATION`, with
   `search_path` set to `pg_catalog, pg_temp` — as `CREATE INDEX` and `REINDEX`
