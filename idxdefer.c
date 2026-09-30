@@ -88,13 +88,13 @@
  * Why this is safe
  * ----------------
  * The target is empty when the statement starts, belongs to this backend, and
- * has no triggers, no exclusion indexes and no ON CONFLICT clause, and unless
- * idxdefer.defer_unique_indexes is on, no unique indexes either: nothing needs
- * the index to decide what happens to a row.  So the state in between - rows
- * in the heap that the index does not know about - can only be observed by
- * reading the table, and can only outlive the statement on error.  (A unique
- * index does decide what happens to a row, whether it goes in or raises an
- * error; see "Unique indexes" below for why deferring that decision is safe.)
+ * has no triggers, no exclusion indexes and no ON CONFLICT clause: apart from
+ * the unique check, nothing needs the index to decide what happens to a row.
+ * So the state in between - rows in the heap that the index does not know
+ * about - can only be observed by reading the table, and can only outlive the
+ * statement on error.  (A unique index does decide what happens to a row,
+ * whether it goes in or raises an error; see "Unique indexes" below for why
+ * deferring that decision is safe.)
  *
  * 1.  The statement itself reading the target.  Its own rows are invisible to
  *     its own snapshot, and the table was empty, so any scan in it sees
@@ -130,8 +130,7 @@
  *
  * Unique indexes
  * --------------
- * With idxdefer.defer_unique_indexes on, a unique index - a primary key
- * included - is deferred like any other, and the duplicate check moves from
+ * A unique index - a primary key included - is deferred like any other, and the duplicate check moves from
  * each row to the rebuild, which is the check CREATE UNIQUE INDEX on a filled
  * table makes.  The build checks every tuple that is alive to this
  * transaction, which on a table that started empty means every row that could
@@ -257,7 +256,6 @@ static int	idxdefer_mode = IDXDEFER_ON;
 static int	idxdefer_log_level = DEBUG1;
 static int	idxdefer_min_rows = 1000000;
 static int	idxdefer_maintenance_work_mem = 1024 * 1024;	/* 1GB, in kB */
-static bool idxdefer_defer_unique_indexes = false;
 
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun = NULL;
@@ -452,9 +450,9 @@ idxdefer_get_relation_info(PlannerInfo *root, Oid relationObjectId,
  *		List the table's indexes, or NIL if any of them rules the table out.
  *
  * An exclusion index is checked while each row goes in, by operators a build
- * does not apply, so it cannot be left behind.  A unique one can, if
- * idxdefer.defer_unique_indexes allows it and its check is immediate (see
- * "Unique indexes" at the top of the file); *nunique counts them.  An index
+ * does not apply, so it cannot be left behind.  A unique one can, if its
+ * check is immediate (see "Unique indexes" at the top of the file); *nunique
+ * counts them.  An index
  * that is not ready, not valid or not live is in the middle of something we
  * should not interfere with.  One that is already open - by a cursor, or by a
  * scan in this very statement - would make the rebuild fail in
@@ -483,8 +481,7 @@ idxdefer_collect_indexes(Relation rel, int *nunique)
 
 		usable = (index->indisvalid && index->indisready &&
 				  index->indislive && !index->indisexclusion &&
-				  (!index->indisunique ||
-				   (idxdefer_defer_unique_indexes && index->indimmediate)) &&
+				  (!index->indisunique || index->indimmediate) &&
 				  irel->rd_refcnt == 1);
 
 		if (index->indisunique)
@@ -1025,7 +1022,7 @@ idxdefer_check_writer(PlannedStmt *pstmt)
 						 errmsg("cannot write to table \"%s\" while an insert into it defers its unique checks",
 								get_rel_name(relid)),
 						 errdetail("The statement would check its rows against unique indexes that do not yet contain the rows inserted so far."),
-						 errhint("Set idxdefer.defer_unique_indexes to off.")));
+						 errhint("Set idxdefer.mode to off.")));
 		}
 	}
 }
@@ -1383,15 +1380,6 @@ idxdefer_init(void)
 							PGC_USERSET,
 							GUC_UNIT_KB,
 							NULL, NULL, NULL);
-
-	DefineCustomBoolVariable("idxdefer.defer_unique_indexes",
-							 "Allows deferring the maintenance of unique indexes and primary keys.",
-							 "When on, a table with unique indexes qualifies like any other, and a duplicate key among the inserted rows is reported by the rebuild, after all the rows are in, rather than on the row that causes it.",
-							 &idxdefer_defer_unique_indexes,
-							 false,
-							 PGC_USERSET,
-							 0,
-							 NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("idxdefer");
 

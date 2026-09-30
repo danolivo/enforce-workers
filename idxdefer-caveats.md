@@ -42,9 +42,8 @@ nothing is reported unless the refusal is about hook order (see
   foreign key — on either side of it — and statement-level triggers.
 * **Any exclusion index disqualifies the whole table**, not just that index:
   one index that must be maintained row by row means the executor has to open
-  them all. So does any unique or primary-key index while
-  `idxdefer.defer_unique_indexes` is off (the default), and a deferrable one
-  always.
+  them all. So does a deferrable unique or primary-key index; an immediate one
+  is deferred, see [§4](#4-behaviour-that-changes).
 * **An index that is already open disqualifies the table.** A cursor in the same
   transaction that scans the target through an index is enough.
 * **`RETURNING`, `ON CONFLICT` (any form) and data-modifying CTEs are never
@@ -248,8 +247,7 @@ Other points:
   `CONTEXT` line naming the index. The statement fails either way and nothing
   is left behind, but the time spent inserting is wasted and the error looks
   different to anything parsing it.
-* **Duplicate keys are reported by the rebuild** when
-  `idxdefer.defer_unique_indexes` is on: after all rows are in, as `could not
+* **Duplicate keys are reported by the rebuild**: after all rows are in, as `could not
   create unique index`, naming whichever duplicate the sort meets first. Same SQLSTATE
   and constraint name; the statement fails as a whole either way. The source
   query's side effects happen for every row first. See the README.
