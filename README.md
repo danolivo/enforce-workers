@@ -481,8 +481,9 @@ An `INSERT` qualifies when all of these hold:
   no data-modifying CTE, and not under `EXPLAIN` without `ANALYZE`;
 * the target is an ordinary temporary table of this backend, not a parallel
   worker's view of the leader's;
-* the table has no triggers, and every index is valid, ready, live, neither
-  unique nor exclusion, and not currently open — by a cursor, or by a scan in
+* the table has no triggers, and every index is valid, ready, live, not an
+  exclusion index, not unique unless `idxdefer.defer_unique_indexes` is on (and
+  then not deferrable), and not currently open — by a cursor, or by a scan in
   the statement itself;
 * the table has no pages when the statement starts;
 * the planner expects at least `idxdefer.min_rows` rows.
@@ -551,6 +552,7 @@ the statement on an error.
 | `idxdefer.mode` | `on` | `off` leaves inserts alone; `log` reports the inserts that would be deferred; `on` defers them. |
 | `idxdefer.log_level` | `debug1` | Level at which deferrals and rebuilds are reported; the estimate is in the `DETAIL`. |
 | `idxdefer.min_rows` | `1000000` | Planner estimate below which an insert keeps its index maintenance. |
+| `idxdefer.defer_unique_indexes` | `off` | Lets unique indexes and primary keys be deferred too; a duplicate key is then reported by the rebuild. See below. |
 | `idxdefer.maintenance_work_mem` | `1GB` | Upper limit on the memory for rebuilding one index. A B-tree gets the estimated sort size if that is smaller; other index types get this value. At least 64kB. |
 
 The default for `min_rows` comes from the stand: in a baseline run of the
@@ -558,9 +560,41 @@ The default for `min_rows` comes from the stand: in a baseline run of the
 are 98% of the index maintenance time, and those below a hundred thousand are
 0.2%.
 
-### Caveats
+### Unique indexes and primary keys
 
-The full list — what changes, what it costs, the correct load order and the
+With `idxdefer.defer_unique_indexes = on` a unique index is deferred like any
+other, and the duplicate check moves from each row to the rebuild — the check
+`CREATE UNIQUE INDEX` makes on a filled table. A duplicate is never let
+through: the statement still fails as a whole, with the same SQLSTATE
+(`23505 unique_violation`) and the same constraint name. What changes is when
+and how:
+
+* the error comes after every row is in, and reads `could not create unique
+  index "t_pkey"` with `Key (a)=(1) is duplicated.`, not `duplicate key value
+  violates unique constraint`; with a `CONTEXT` line saying the rebuild did it,
+  and the deferral itself is logged as "unique checks included";
+* the key it names is whichever duplicate the sort meets first, not the
+  first one in insert order;
+* the source query runs to the end first, so its side effects — sequence
+  values, notices — happen for every row.
+
+This is only meant for 1C, whose bulk inserts never collide and never have
+anything else write to the table while they run, and it relies on that. The
+limits:
+
+* **No other statement may write to the table during the insert.** A
+  `VOLATILE` function in the source query or a trigger on another table that
+  inserts or updates the target would check its own rows against a unique
+  index that lacks the rows inserted so far. Such a statement is refused before
+  it starts, with `cannot write to table "t" while an insert into it defers its
+  unique checks`. `COPY` does not go through the executor hooks and is not
+  refused; a duplicate it creates is still caught, by the rebuild, as an error.
+* **Deferrable unique constraints and exclusion constraints are never
+  deferred.**
+* **`ON CONFLICT` is never deferred**, as before.
+
+### Caveats
+ — what changes, what it costs, the correct load order and the
 check in the code that enforces it, interaction with `auto_explain`,
 `pg_stat_statements`, `online_analyze` and other libraries, and what has not
 been tested — is in **[idxdefer-caveats.md](idxdefer-caveats.md)**. The ones
@@ -591,8 +625,9 @@ heap in any case. Covered:
   and with it, which does; a prepared insert with a cached generic plan,
   deferred on each execution into an empty table and left alone otherwise;
 * what is left alone: an insert below `min_rows`, into a non-empty table, into a
-  permanent table, with a unique index or a primary key (and the duplicate
-  still caught on its row), with `ON CONFLICT DO NOTHING`, with `RETURNING`,
+  permanent table, with a unique index or a primary key while
+  `idxdefer.defer_unique_indexes` is off (and the duplicate still caught on its
+  row), with `ON CONFLICT DO NOTHING`, with `RETURNING`,
   inside a data-modifying CTE, on a table with a trigger, and with an index held
   open by a cursor; a plain CTE in the source is deferred;
 * `log` and `off`;
@@ -607,6 +642,11 @@ heap in any case. Covered:
   while the insert runs;
 * a deferred insert nested in a function called by another query, and one
   nested inside a deferred insert into the same table;
+* with `idxdefer.defer_unique_indexes`: a primary key and a unique index with
+  NULLs rebuilt and enforced afterwards; a duplicate in the middle of the
+  stream, which leaves the old index and no live rows; the SQLSTATE caught as
+  `unique_violation`; a deferrable key and an exclusion constraint left alone;
+  a `VOLATILE` function writing to the target refused;
 * a GIN index;
 * the memory the rebuild gets: an index expression reports
   `maintenance_work_mem` while the rebuild evaluates it, once with the estimate
