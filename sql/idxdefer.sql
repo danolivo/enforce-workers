@@ -128,25 +128,10 @@ INSERT INTO perm SELECT generate_series(1, 5000);
 SELECT idx_ok('perm_a');
 DROP TABLE perm;
 
--- A unique index is checked on every row, so it keeps being maintained, and
--- the duplicate is still caught where it happens.
-CREATE TEMP TABLE uniq (a int);
-CREATE UNIQUE INDEX uniq_a ON uniq (a);
-INSERT INTO uniq SELECT i % 3000 FROM generate_series(1, 5000) i;
-INSERT INTO uniq SELECT generate_series(1, 5000);
-SELECT idx_ok('uniq_a'), count(*) FROM uniq;
-
--- A primary key is a unique index as well.
-CREATE TEMP TABLE pk (a int PRIMARY KEY, b int);
-CREATE INDEX pk_b ON pk (b);
-INSERT INTO pk SELECT i, i FROM generate_series(1, 5000) i;
-SELECT idx_ok('pk_pkey'), idx_ok('pk_b');
-
 --
--- idxdefer.defer_unique_indexes: unique indexes and primary keys are deferred
--- too, and the duplicate check moves from each row to the rebuild.
+-- Unique indexes and primary keys are deferred too, and the duplicate check
+-- moves from each row to the rebuild.
 --
-SET idxdefer.defer_unique_indexes = on;
 
 -- No duplicates: rebuilt and valid, NULLs in a unique column allowed as
 -- usual, and the rebuilt key enforces uniqueness row by row afterwards.
@@ -206,8 +191,6 @@ END
 $$;
 INSERT INTO upk_w SELECT upk_write(i) FROM generate_series(1, 5000) i;
 SELECT idx_ok('upk_w_pkey'), count(*) FROM upk_w;
-
-RESET idxdefer.defer_unique_indexes;
 
 -- ON CONFLICT, even with nothing to conflict on.
 CREATE TEMP TABLE onconf (a int);
